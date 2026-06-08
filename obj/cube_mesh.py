@@ -1,10 +1,12 @@
 import numpy as np
 
-from .indexed_mesh import IndexedMesh
+from .indexed_mesh import MalhaIndexada
 
 
-class CubeMesh(IndexedMesh):
+class MalhaCubo(MalhaIndexada):
+    """Gera um cubo unitário centrado na origem, com normais para iluminação."""
     def __init__(self):
+        """Monta os arrays de vértices/índices e envia para a MalhaIndexada."""
         vertices = [
             -1, -1, 1, 0, 0, 1, 1, -1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, -1, 1, 1, 0, 0, 1,
             -1, -1, -1, 0, 0, -1, 1, -1, -1, 0, 0, -1, 1, 1, -1, 0, 0, -1, -1, 1, -1, 0, 0, -1,
@@ -25,5 +27,5 @@ class CubeMesh(IndexedMesh):
         super().__init__(
             vertices=np.array(vertices, dtype=np.float32),
             indices=np.array(indices, dtype=np.uint32),
-            stride_floats=6,
+            passo_floats=6,
         )
