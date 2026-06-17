@@ -1,15 +1,16 @@
-from OpenGL.GL import *
-import OpenGL.GL.shaders as gls
+WINDOW_WIDTH = 1366
+WINDOW_HEIGHT = 697
+GAME_TITLE = "Reino das Moedas"
 
+CAMERA_DISTANCE = 45.0
+CAMERA_ANGLE = 3.141592653589793
+CAMERA_FORWARD_OFFSET = 0.0
 
-def criar_programa_de_arquivos(caminho_vertice: str, caminho_fragmento: str) -> int:
-    """Lê os arquivos de shader, compila e linka um programa OpenGL."""
-    with open(caminho_vertice, "r", encoding="utf-8") as arquivo:
-        fonte_vertice = arquivo.read()
-    with open(caminho_fragmento, "r", encoding="utf-8") as arquivo:
-        fonte_fragmento = arquivo.read()
-    # Compilação separada do shader de vértice e do shader de fragmento.
-    id_vertice = gls.compileShader(fonte_vertice, GL_VERTEX_SHADER)
-    id_fragmento = gls.compileShader(fonte_fragmento, GL_FRAGMENT_SHADER)
-    # Linkagem: cria o programa final usado na renderização.
-    return gls.compileProgram(id_vertice, id_fragmento)
+BOARD_HALF_WIDTH = 7.0
+BOARD_BOTTOM_LENGTH = 16.0
+BOARD_TOP_LENGTH = 16.0
+
+ROLETA_X = 501.0
+ROLETA_Y = 0.0
+ROLETA_LARGURA = 360.0
+ROLETA_ALTURA = 132.0

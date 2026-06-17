@@ -1,1017 +1,1439 @@
+from pathlib import Path
+import ctypes
 import math
-import os
 import random
-import time
 
 import glfw
-from OpenGL.GL import *
 import glm
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from OpenGL.GL import *
 
-from obj import MalhaCubo, MalhaEsfera, MalhaBarreiraCurva
-from config import criar_programa_de_arquivos
+from config import *
+from obj.geometry import create_cube, create_sphere, create_curved_barrier
 
 
-class TabuleiroGame:
-    """
-    Controla o estado do jogo e o loop de atualização/renderização.
+SHADER_DIR = Path(__file__).with_name("shaders")
 
-    Estrutura geral:
-    - "selecao": escolher os campeões de cada jogador.
-    - "jogando": alterna turnos, gira roleta e executa ações (ataque/roubo/evolução/defesa).
-    """
 
+def load_shader_source(filename):
+    return (SHADER_DIR / filename).read_text(encoding="utf-8")
+
+
+VERTEX_SHADER = load_shader_source("vertex.glsl")
+FRAGMENT_SHADER = load_shader_source("fragment.glsl")
+BUTTON_VERTEX_SHADER = load_shader_source("button_vertex.glsl")
+BUTTON_FRAGMENT_SHADER = load_shader_source("button_fragment.glsl")
+TEXT_VERTEX_SHADER = load_shader_source("text_vertex.glsl")
+TEXT_FRAGMENT_SHADER = load_shader_source("text_fragment.glsl")
+
+
+
+
+
+
+def compile_shader(source, shader_type):
+    shader = glCreateShader(shader_type)
+    glShaderSource(shader, source)
+    glCompileShader(shader)
+
+    if not glGetShaderiv(shader, GL_COMPILE_STATUS):
+        raise Exception(glGetShaderInfoLog(shader).decode())
+
+    return shader
+
+
+def create_shader_program(vertex_source, fragment_source):
+    vertex = compile_shader(vertex_source, GL_VERTEX_SHADER)
+    fragment = compile_shader(fragment_source, GL_FRAGMENT_SHADER)
+
+    program = glCreateProgram()
+    glAttachShader(program, vertex)
+    glAttachShader(program, fragment)
+    glLinkProgram(program)
+
+    if not glGetProgramiv(program, GL_LINK_STATUS):
+        raise Exception(glGetProgramInfoLog(program).decode())
+
+    glDeleteShader(vertex)
+    glDeleteShader(fragment)
+
+    return program
+
+
+def framebuffer_size_callback(window, width, height):
+    glViewport(0, 0, width, height)
+
+
+def to_ndc(x, y, window_width, window_height):
+    return (x / window_width) * 2.0 - 1.0, 1.0 - (y / window_height) * 2.0
+
+
+def create_button_renderer():
+    program = create_shader_program(BUTTON_VERTEX_SHADER, BUTTON_FRAGMENT_SHADER)
+
+    vao = glGenVertexArrays(1)
+    vbo = glGenBuffers(1)
+
+    glBindVertexArray(vao)
+    glBindBuffer(GL_ARRAY_BUFFER, vbo)
+    glBufferData(GL_ARRAY_BUFFER, 6 * 5 * 4, None, GL_DYNAMIC_DRAW)
+
+    stride = 5 * 4
+
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+    glEnableVertexAttribArray(0)
+
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(8))
+    glEnableVertexAttribArray(1)
+
+    glBindVertexArray(0)
+
+    return program, vao, vbo
+
+
+class TextRenderer:
+    # Renderiza texto como textura OpenGL, substituindo o antigo mapa manual de letras.
     def __init__(self):
-        """Inicializa todos os estados do jogo e parâmetros de cena."""
-        self.resolucao = [1280, 720]
-
-        self.log_ativo = True
-        self._contador_eventos = 0
-        self._partida_finalizada = False
-        self.vencedor_time = None
-
-        # Programa de shader e locais (uniforms) usados na cena 3D.
-        self.id_shader = 0
-        self.locais = {}
-
-
-        # Malhas básicas usadas para desenhar o tabuleiro e os elementos.
-        self.cubo = None
-        self.esfera = None
-        self.barreira = None
-
-        # Estado da UI em 3D: seleção de campeões ou partida.
-        self.modo = "selecao"
-        self.opcoes_campeoes = [
-            {"nome": "Tigre", "tipo": "tigre", "cor": (0.2, 0.5, 1.0)},
-            {"nome": "Macaco", "tipo": "macaco", "cor": (1.0, 0.2, 0.2)},
-            {"nome": "Panda", "tipo": "panda", "cor": (0.2, 1.0, 0.4)},
-            {"nome": "Dragao", "tipo": "dragao", "cor": (0.7, 0.3, 1.0)},
-        ]
-        self.indice_campeao_selecionado = 0
-        self._slots_jogadores_time = [
-            [2, 3],
-            [0, 1],
-        ]
-        self._time_selecionando = 0
-        self._slot_selecionando = 0
-        self._indices_campeoes_escolhidos = [[None, None], [None, None]]
-        self._estado_tecla_anterior = {}
-
-        # Estado da partida (recursos, campeões e turno).
-        self.campeoes = {}
-        self.pontos_time = [
-            {"esquerda": 0, "direita": 0, "muro": 0},
-            {"esquerda": 0, "direita": 0, "muro": 0},
-        ]
-        self.vida_muro_time = [0, 0]
-        self.moedas_time = [10, 10]
-        self.jogador_turno = 0
-        self.fase_turno = "roleta"
-        self.roleta_girando = False
-        self.tempo_roleta = 0.0
-        self.duracao_giro_roleta = 0.9
-        self.resultados_roleta = []
-
-        # Parâmetros da câmera.
-        self.distancia_camera = 45.0
-        self.angulo_camera = 0.0
-        self.deslocamento_frente_camera = 0.0
-
-        # Dimensões do tabuleiro.
-        self.tabuleiro_meia_largura = 7.0
-        self.tabuleiro_comprimento_baixo = 16.0
-        self.tabuleiro_comprimento_cima = 16.0
-
-        # Posições fixas da barreira por time.
-        self.pos_barreira_azul = glm.vec3(0, 0.05, 4.0)
-        self.pos_barreira_vermelha = glm.vec3(0, 0.05, -4.0)
-
-        # Jogadores (peças) e suas cores, ajustadas na escolha dos campeões.
-        self.jogadores = [
-            {"posicao": glm.vec3(-4, 0.5, 8), "cor": (0.2, 0.5, 1.0)},
-            {"posicao": glm.vec3(4, 0.5, 8), "cor": (0.2, 0.5, 1.0)},
-            {"posicao": glm.vec3(-4, 0.5, -8), "cor": (1.0, 0.2, 0.2)},
-            {"posicao": glm.vec3(4, 0.5, -8), "cor": (1.0, 0.2, 0.2)},
-        ]
-
-        # Objetivos e sacos (representação das moedas) por lado.
-        self.pos_gol_azul = glm.vec3(0, 0.05, 5.5)
-        self.pos_gol_vermelho = glm.vec3(0, 0.05, -5.5)
-
-        self.pos_saco_azul = glm.vec3(0, 0.4, 5.5)
-        self.pos_saco_vermelho = glm.vec3(0, 0.4, -5.5)
-
-        self._registrar_evento("Jogo iniciado (modo=selecao)")
-
-    def _registrar_evento(self, mensagem: str):
-        if not getattr(self, "log_ativo", False):
-            return
-        self._contador_eventos += 1
-        timestamp_ms = int(time.time() * 1000)
-        print(f"[{self._contador_eventos:04d} {timestamp_ms}] {mensagem}", flush=True)
-
-    def _nome_tecla(self, tecla: int) -> str:
-        mapeamento = {
-            glfw.KEY_LEFT: "ESQUERDA",
-            glfw.KEY_RIGHT: "DIREITA",
-            glfw.KEY_ENTER: "ENTER",
-            glfw.KEY_SPACE: "ESPACO",
-            glfw.KEY_BACKSPACE: "BACKSPACE",
-            glfw.KEY_ESCAPE: "ESC",
-            glfw.KEY_0: "0",
-            glfw.KEY_1: "1",
-            glfw.KEY_2: "2",
-            glfw.KEY_3: "3",
-            glfw.KEY_4: "4",
-            glfw.KEY_5: "5",
-            glfw.KEY_6: "6",
-            glfw.KEY_7: "7",
-            glfw.KEY_P: "P",
-        }
-        if tecla in mapeamento:
-            return mapeamento[tecla]
-        nome = glfw.get_key_name(tecla, 0)
-        if nome:
-            return nome.upper()
-        return str(tecla)
-
-    def _resumo_time(self, time: int) -> str:
-        return (
-            f"time={time} moedas={self.moedas_time[time]} "
-            f"muro={self.vida_muro_time[time]} "
-            f"pontos(E={self.pontos_time[time]['esquerda']},D={self.pontos_time[time]['direita']},M={self.pontos_time[time]['muro']})"
-        )
-
-    def _desenhar_digito_7_segmentos(self, digito: int, centro: glm.vec3, tamanho: float, cor):
-        segmentos_por_digito = {
-            0: (0, 1, 2, 4, 5, 6),
-            1: (2, 5),
-            2: (0, 2, 3, 4, 6),
-            3: (0, 2, 3, 5, 6),
-            4: (1, 2, 3, 5),
-            5: (0, 1, 3, 5, 6),
-            6: (0, 1, 3, 4, 5, 6),
-            7: (0, 2, 5),
-            8: (0, 1, 2, 3, 4, 5, 6),
-            9: (0, 1, 2, 3, 5, 6),
-        }
-        ativos = segmentos_por_digito.get(digito, ())
-        comp_h = tamanho * 0.8
-        comp_v = tamanho * 0.65
-        esp = tamanho * 0.14
-        prof = tamanho * 0.08
-        dx = tamanho * 0.42
-        dy = tamanho * 0.46
-        posicoes = {
-            0: (0.0, dy, comp_h, esp),
-            3: (0.0, 0.0, comp_h, esp),
-            6: (0.0, -dy, comp_h, esp),
-            1: (-dx, dy / 2.0, esp, comp_v),
-            4: (-dx, -dy / 2.0, esp, comp_v),
-            2: (dx, dy / 2.0, esp, comp_v),
-            5: (dx, -dy / 2.0, esp, comp_v),
-        }
-        for seg in ativos:
-            x, y, sx, sy = posicoes[seg]
-            self.desenhar_cubo(
-                glm.vec3(centro.x + x, centro.y + y, centro.z),
-                glm.vec3(sx / 2.0, sy / 2.0, prof / 2.0),
-                cor,
-            )
-
-    def _desenhar_numero_7_segmentos(self, valor: int, centro: glm.vec3, tamanho: float, cor):
-        texto = str(max(0, int(valor)))
-        if len(texto) > 3:
-            texto = texto[-3:]
-        espacamento = tamanho * 0.9
-        largura_total = len(texto) * espacamento
-        x0 = centro.x - largura_total / 2.0 + espacamento / 2.0
-        for i, ch in enumerate(texto):
-            self._desenhar_digito_7_segmentos(
-                int(ch),
-                glm.vec3(x0 + i * espacamento, centro.y, centro.z),
-                tamanho,
-                cor,
-            )
-
-    def _renderizar_placar_superior(self, proporcao: float):
-        glDisable(GL_DEPTH_TEST)
-        glUseProgram(self.id_shader)
-
-        projecao = glm.ortho(-proporcao, proporcao, -1.0, 1.0, -1.0, 1.0)
-        visao = glm.mat4(1.0)
-        posicao_camera = glm.vec3(0, 0, 1)
-        glUniformMatrix4fv(self.locais["projection"], 1, GL_FALSE, glm.value_ptr(projecao))
-        glUniformMatrix4fv(self.locais["view"], 1, GL_FALSE, glm.value_ptr(visao))
-        glUniform3f(self.locais["lightColor"], 1, 1, 1)
-        glUniform3f(self.locais["lightPos"], 0, 14, 0)
-        glUniform3fv(self.locais["viewPos"], 1, glm.value_ptr(posicao_camera))
-
-        margem = 0.18
-        largura_painel = 0.95
-        altura_painel = 0.30
-        y = 0.83
-
-        x_esquerda = -proporcao + margem + largura_painel / 2.0
-        x_direita = proporcao - margem - largura_painel / 2.0
-
-        cor_fundo = (0.08, 0.08, 0.1)
-        cor_borda = (0.25, 0.25, 0.27)
-
-        self.desenhar_cubo(glm.vec3(x_esquerda, y, 0.0), glm.vec3(largura_painel / 2.0, altura_painel / 2.0, 0.02), cor_borda)
-        self.desenhar_cubo(glm.vec3(x_esquerda, y, 0.01), glm.vec3(largura_painel / 2.0 - 0.03, altura_painel / 2.0 - 0.03, 0.02), cor_fundo)
-
-        self.desenhar_cubo(glm.vec3(x_direita, y, 0.0), glm.vec3(largura_painel / 2.0, altura_painel / 2.0, 0.02), cor_borda)
-        self.desenhar_cubo(glm.vec3(x_direita, y, 0.01), glm.vec3(largura_painel / 2.0 - 0.03, altura_painel / 2.0 - 0.03, 0.02), cor_fundo)
-
-        cor_p1 = (1.0, 0.85, 0.20)
-        cor_p2 = (1.0, 0.85, 0.20)
-        tamanho_digito = altura_painel * 0.65
-        self._desenhar_numero_7_segmentos(self.moedas_time[0], glm.vec3(x_esquerda, y, 0.03), tamanho_digito, cor_p1)
-        self._desenhar_numero_7_segmentos(self.moedas_time[1], glm.vec3(x_direita, y, 0.03), tamanho_digito, cor_p2)
-
-        glEnable(GL_DEPTH_TEST)
-
-    def _renderizar_tela_vitoria(self, proporcao: float):
-        glDisable(GL_DEPTH_TEST)
-        glUseProgram(self.id_shader)
-
-        projecao = glm.ortho(-proporcao, proporcao, -1.0, 1.0, -1.0, 1.0)
-        visao = glm.mat4(1.0)
-        posicao_camera = glm.vec3(0, 0, 1)
-        glUniformMatrix4fv(self.locais["projection"], 1, GL_FALSE, glm.value_ptr(projecao))
-        glUniformMatrix4fv(self.locais["view"], 1, GL_FALSE, glm.value_ptr(visao))
-        glUniform3f(self.locais["lightColor"], 1, 1, 1)
-        glUniform3f(self.locais["lightPos"], 0, 14, 0)
-        glUniform3fv(self.locais["viewPos"], 1, glm.value_ptr(posicao_camera))
-
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-
-        self.desenhar_cubo(glm.vec3(0, 0, 0.0), glm.vec3(proporcao, 1.0, 0.02), (0.0, 0.75, 0.2))
-
-        self.desenhar_cubo(glm.vec3(0, 0, 0.01), glm.vec3(min(proporcao, 1.2) * 0.65, 0.55, 0.02), (0.06, 0.12, 0.06))
-
-        if self.vencedor_time == 0:
-            numero = 1
-        elif self.vencedor_time == 1:
-            numero = 2
-        else:
-            numero = 0
-
-        self._desenhar_numero_7_segmentos(numero, glm.vec3(0, 0, 0.03), 0.60, (0.95, 0.95, 0.95))
-
-        glEnable(GL_DEPTH_TEST)
-
-    def _reiniciar_estado_partida(self):
-        """Reseta recursos da partida e sincroniza a câmera para o início."""
-        self._partida_finalizada = False
-        self.campeoes = {}
-        self.campeoes = {}
-        self.pontos_time = [
-            {"esquerda": 0, "direita": 0, "muro": 0},
-            {"esquerda": 0, "direita": 0, "muro": 0},
-        ]
-        self.vida_muro_time = [0, 0]
-        self.moedas_time = [10, 10]
-        self.jogador_turno = 0
-        self.fase_turno = "roleta"
-        self.roleta_girando = False
-        self.tempo_roleta = 0.0
-        self.resultados_roleta = []
-        self._aplicar_camera_turno()
-        self._registrar_evento("Partida reiniciada (turno=0, fase=roleta)")
-
-    def _aplicar_camera_turno(self):
-        """Posiciona a câmera do ponto de vista do jogador do turno atual."""
-        if self.jogador_turno == 0:
-            self.angulo_camera = 0.0
-            self.deslocamento_frente_camera = 8.0
-        else:
-            self.angulo_camera = math.pi
-            self.deslocamento_frente_camera = 8.0
-
-    def _recursos_time(self, time: int):
-        """Retorna posições/rotação associadas a um time (0/1) para desenhar objetos."""
-        if time == 0:
-            return {
-                "pos_saco": self.pos_saco_vermelho,
-                "pos_barreira": self.pos_barreira_vermelha,
-                "rotacao_barreira": 0,
-                "pos_gol": self.pos_gol_vermelho,
-            }
-        return {
-            "pos_saco": self.pos_saco_azul,
-            "pos_barreira": self.pos_barreira_azul,
-            "rotacao_barreira": 180,
-            "pos_gol": self.pos_gol_azul,
-        }
-
-    def _indice_jogador_time_lado(self, time: int, lado: int) -> int:
-        """Mapeia (time, lado) -> índice do jogador no array self.jogadores."""
-        return self._slots_jogadores_time[time][lado]
-
-    def _iniciar_estado_campeao(self, tipo_campeao: str):
-        """Cria o dicionário de atributos do campeão (custos/danos/regras)."""
-        if tipo_campeao == "tigre":
-            return {
-                "tipo": "tigre",
-                "custo_ataque": 5,
-                "dano_ataque": 3,
-                "custo_roubo": None,
-                "quantidade_roubo": 0,
-                "custo_evoluir": 8,
-                "quantidade_evolucoes": 0,
-                "ignorar_muro": False,
-            }
-        if tipo_campeao == "macaco":
-            return {
-                "tipo": "macaco",
-                "custo_ataque": 5,
-                "dano_ataque": 1,
-                "custo_roubo": 7,
-                "quantidade_roubo": 1,
-                "custo_evoluir": 8,
-                "quantidade_evolucoes": 0,
-                "ignorar_muro": True,
-            }
-        if tipo_campeao == "panda":
-            return {
-                "tipo": "panda",
-                "custo_ataque": 5,
-                "dano_ataque": 3,
-                "custo_roubo": 3,
-                "quantidade_roubo": 2,
-                "custo_evoluir": 8,
-                "quantidade_evolucoes": 0,
-                "ignorar_muro": False,
-            }
-        return {
-            "tipo": "dragao",
-            "custo_ataque": 5,
-            "dano_ataque": 1,
-            "custo_roubo": None,
-            "quantidade_roubo": 0,
-            "custo_evoluir": 8,
-            "quantidade_evolucoes": 0,
-            "ignorar_muro": True,
-        }
-
-    def _iniciar_giro_roleta(self):
-        """Inicia a animação/temporização do giro da roleta."""
-        self.roleta_girando = True
-        self.tempo_roleta = 0.0
-        self.resultados_roleta = []
-
-    def _finalizar_roleta(self):
-        """
-        Conclui a roleta: sorteia 5 resultados e adiciona pontos ao jogador do turno.
-
-        Os resultados são guardados em self.resultados_roleta para serem desenhados no tablet 3D.
-        """
-        cor_esquerda = self.jogadores[self._indice_jogador_time_lado(self.jogador_turno, 0)]["cor"]
-        cor_direita = self.jogadores[self._indice_jogador_time_lado(self.jogador_turno, 1)]["cor"]
-        cor_muro = (0.55, 0.55, 0.55)
-
-        resultados = []
-        for _ in range(5):
-            categoria = random.randint(0, 2)
-            if categoria == 0:
-                self.pontos_time[self.jogador_turno]["esquerda"] += 1
-                resultados.append(("esquerda", cor_esquerda))
-            elif categoria == 1:
-                self.pontos_time[self.jogador_turno]["direita"] += 1
-                resultados.append(("direita", cor_direita))
-            else:
-                self.pontos_time[self.jogador_turno]["muro"] += 1
-                resultados.append(("muro", cor_muro))
-
-        self.resultados_roleta = resultados
-        self.fase_turno = "acao"
-        contagem = {"esquerda": 0, "direita": 0, "muro": 0}
-        for categoria, _ in resultados:
-            if categoria in contagem:
-                contagem[categoria] += 1
-        self._registrar_evento(
-            "Roleta finalizada "
-            f"(turno={self.jogador_turno} +E={contagem['esquerda']} +D={contagem['direita']} +M={contagem['muro']}) | "
-            f"{self._resumo_time(self.jogador_turno)}"
-        )
-
-    def _pode_roubar_com_muro(self, estado_campeao) -> bool:
-        """Regra especial: alguns campeões conseguem roubar mesmo com muro ativo."""
-        return estado_campeao["tipo"] == "macaco"
-
-    def _executar_ataque(self, lado: int) -> bool:
-        """Executa ataque do lado (0=esquerda, 1=direita) do time do turno."""
-        atacante = self.jogador_turno
-        defensor = 1 - atacante
-        chave_pool = "esquerda" if lado == 0 else "direita"
-        pontos = self.pontos_time[atacante][chave_pool]
-        campeao = self.campeoes.get(self._indice_jogador_time_lado(atacante, lado))
-        if campeao is None:
-            return False
-        if pontos < campeao["custo_ataque"]:
-            return False
-
-        self.pontos_time[atacante][chave_pool] -= campeao["custo_ataque"]
-        dano = campeao["dano_ataque"]
-
-        if campeao["ignorar_muro"]:
-            self.moedas_time[defensor] = max(0, self.moedas_time[defensor] - dano)
-            return True
-
-        if self.vida_muro_time[defensor] > 0:
-            self.vida_muro_time[defensor] = max(0, self.vida_muro_time[defensor] - dano)
-            return True
-
-        if campeao["tipo"] in ("tigre", "panda"):
-            self.moedas_time[defensor] = max(0, self.moedas_time[defensor] - dano)
-            return True
-
-        self.moedas_time[defensor] = max(0, self.moedas_time[defensor] - dano)
-        return True
-
-    def _executar_roubo(self, lado: int) -> bool:
-        """Executa roubo do lado (0=esquerda, 1=direita) do time do turno."""
-        atacante = self.jogador_turno
-        defensor = 1 - atacante
-        chave_pool = "esquerda" if lado == 0 else "direita"
-        campeao = self.campeoes.get(self._indice_jogador_time_lado(atacante, lado))
-        if campeao is None:
-            return False
-        if campeao["custo_roubo"] is None:
-            return False
-        if self.pontos_time[atacante][chave_pool] < campeao["custo_roubo"]:
-            return False
-
-        if self.vida_muro_time[defensor] > 0 and not (campeao["ignorar_muro"] or self._pode_roubar_com_muro(campeao)):
-            return False
-
-        quantidade = campeao["quantidade_roubo"]
-        if quantidade <= 0:
-            return False
-
-        self.pontos_time[atacante][chave_pool] -= campeao["custo_roubo"]
-        roubado = min(quantidade, self.moedas_time[defensor])
-        self.moedas_time[defensor] -= roubado
-        self.moedas_time[atacante] += roubado
-        return True
-
-    def _executar_evolucao(self, lado: int) -> bool:
-        """Evolui o campeão do lado escolhido, consumindo pontos e aumentando atributos."""
-        atacante = self.jogador_turno
-        chave_pool = "esquerda" if lado == 0 else "direita"
-        campeao = self.campeoes.get(self._indice_jogador_time_lado(atacante, lado))
-        if campeao is None:
-            return False
-        if self.pontos_time[atacante][chave_pool] < campeao["custo_evoluir"]:
-            return False
-
-        self.pontos_time[atacante][chave_pool] -= campeao["custo_evoluir"]
-        campeao["quantidade_evolucoes"] += 1
-        if campeao["tipo"] == "macaco":
-            campeao["quantidade_roubo"] += 1
-        elif campeao["tipo"] == "panda":
-            campeao["dano_ataque"] += 1
-            campeao["quantidade_roubo"] += 1
-        else:
-            campeao["dano_ataque"] += 1
-        return True
-
-    def _executar_defesa(self) -> bool:
-        """Converte pontos de muro em vida do muro do time do turno."""
-        time = self.jogador_turno
-        pontos_muro = self.pontos_time[time]["muro"]
-        if pontos_muro <= 0:
-            return False
-        self.pontos_time[time]["muro"] = 0
-        self.vida_muro_time[time] = min(40, self.vida_muro_time[time] + pontos_muro)
-        return True
-
-    def _tem_alguma_acao_para_time(self, time: int) -> bool:
-        """
-        Verifica se o time ainda tem alguma ação possível na fase de ação.
-
-        Usado para pular automaticamente o turno quando não há ações possíveis.
-        """
-        if self.pontos_time[time]["muro"] > 0:
-            return True
-
-        defensor = 1 - time
-
-        for lado in (0, 1):
-            chave_pool = "esquerda" if lado == 0 else "direita"
-            pontos = self.pontos_time[time][chave_pool]
-            campeao = self.campeoes.get(self._indice_jogador_time_lado(time, lado))
-            if campeao is None:
-                continue
-
-            if pontos >= campeao["custo_ataque"]:
-                return True
-
-            if pontos >= campeao["custo_evoluir"]:
-                return True
-
-            if campeao["custo_roubo"] is not None and pontos >= campeao["custo_roubo"]:
-                if campeao["quantidade_roubo"] > 0 and self.moedas_time[defensor] > 0:
-                    if self.vida_muro_time[defensor] == 0 or campeao["ignorar_muro"] or self._pode_roubar_com_muro(campeao):
-                        return True
+        self.program = create_shader_program(TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER)
+        self.vao = glGenVertexArrays(1)
+        self.vbo = glGenBuffers(1)
+        self.cache = {}
+
+        glBindVertexArray(self.vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        glBufferData(GL_ARRAY_BUFFER, 6 * 4 * 4, None, GL_DYNAMIC_DRAW)
+        stride = 4 * 4
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(8))
+        glEnableVertexAttribArray(1)
+        glBindVertexArray(0)
+
+    def _font(self, pixel_size):
+        for font_name in ("arial.ttf", "segoeui.ttf", "calibri.ttf"):
+            try:
+                return ImageFont.truetype(font_name, pixel_size)
+            except OSError:
+                pass
+        return ImageFont.load_default()
+
+    def _texture(self, text, scale, color):
+        key = (text.upper(), scale, tuple(color))
+        if key in self.cache:
+            return self.cache[key]
+
+        font_size = max(10, int(scale * 8))
+        font = self._font(font_size)
+        text = text.upper()
+        bbox = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox((0, 0), text, font=font)
+        width = max(1, bbox[2] - bbox[0] + 4)
+        height = max(1, bbox[3] - bbox[1] + 4)
+        image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        rgba = tuple(int(max(0, min(1, value)) * 255) for value in color) + (255,)
+        draw.text((2 - bbox[0], 2 - bbox[1]), text, font=font, fill=rgba)
+
+        texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, texture)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image.tobytes())
+        self.cache[key] = (texture, width, height)
+        return self.cache[key]
+
+    def measure(self, text, scale):
+        _, width, _ = self._texture(text, scale, (1, 1, 1))
+        return width
+
+    def draw(self, text, x, y, scale, color, window_width, window_height):
+        texture, width, height = self._texture(text, scale, color)
+        left, top = to_ndc(x, y, window_width, window_height)
+        right, bottom = to_ndc(x + width, y + height, window_width, window_height)
+        vertices = np.array([
+            left, bottom, 0.0, 1.0,
+            right, bottom, 1.0, 1.0,
+            right, top, 1.0, 0.0,
+            left, bottom, 0.0, 1.0,
+            right, top, 1.0, 0.0,
+            left, top, 0.0, 0.0,
+        ], dtype=np.float32)
+
+        glUseProgram(self.program)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, texture)
+        glUniform1i(glGetUniformLocation(self.program, "textTexture"), 0)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vertices.nbytes, vertices)
+        glBindVertexArray(self.vao)
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+
+
+def draw_cube(position, scale, color, rotation_y=0):
+    model = glm.mat4(1.0)
+    model = glm.translate(model, position)
+    model = glm.rotate(model, glm.radians(rotation_y), glm.vec3(0, 1, 0))
+    model = glm.scale(model, scale)
+
+    glUniformMatrix4fv(model_loc, 1, GL_FALSE, glm.value_ptr(model))
+    glUniform3f(object_color_loc, *color)
+
+    glBindVertexArray(cube_vao)
+    glDrawElements(GL_TRIANGLES, cube_count, GL_UNSIGNED_INT, None)
+
+
+def draw_sphere(position, scale, color):
+    model = glm.mat4(1.0)
+    model = glm.translate(model, position)
+    model = glm.scale(model, glm.vec3(scale))
+
+    glUniformMatrix4fv(model_loc, 1, GL_FALSE, glm.value_ptr(model))
+    glUniform3f(object_color_loc, *color)
+
+    glBindVertexArray(sphere_vao)
+    glDrawElements(GL_TRIANGLES, sphere_count, GL_UNSIGNED_INT, None)
+
 
+def draw_barrier(position, color, rotation_y=0):
+    model = glm.mat4(1.0)
+    model = glm.translate(model, position)
+    model = glm.rotate(model, glm.radians(rotation_y), glm.vec3(0, 1, 0))
+
+    glUniformMatrix4fv(model_loc, 1, GL_FALSE, glm.value_ptr(model))
+    glUniform3f(object_color_loc, *color)
+
+    glBindVertexArray(barrier_vao)
+    glDrawElements(GL_TRIANGLES, barrier_count, GL_UNSIGNED_INT, None)
+
+
+def get_roleta_x(window_width):
+    return (window_width - roleta_largura) / 2
+
+
+def draw_roleta_tela(window_width, window_height):
+    roleta_tela_x = get_roleta_x(window_width)
+    draw_button(roleta_tela_x + 5, roleta_y + 5, roleta_largura, roleta_altura, (0.03, 0.03, 0.04), window_width, window_height)
+    draw_button(roleta_tela_x, roleta_y, roleta_largura, roleta_altura, (0.05, 0.06, 0.08), window_width, window_height)
+
+    margem = 14
+    tela_x = roleta_tela_x + margem
+    tela_y = roleta_y + margem
+    tela_largura = roleta_largura - margem * 2
+    tela_altura = roleta_altura - margem * 2
+    draw_button(tela_x, tela_y, tela_largura, tela_altura, (0.12, 0.14, 0.17), window_width, window_height)
+
+    gap = 8
+    barra_largura = (tela_largura - gap * 6) / 5
+    barra_altura = tela_altura - gap * 2
+
+    for i, resultado in enumerate(roleta_resultados):
+        barra_x = tela_x + gap + i * (barra_largura + gap)
+        barra_y = tela_y + gap
+        draw_button(barra_x, barra_y, barra_largura, barra_altura, roleta_opcoes[resultado]["color"], window_width, window_height)
+
+
+def draw_stat_bar(x, y, w, h, value, max_value, color, window_width, window_height):
+    draw_button(x, y, w, h, (0.16, 0.17, 0.20), window_width, window_height)
+    fill_w = w * max(0, min(max_value, value)) / max_value
+    draw_button(x, y, fill_w, h, color, window_width, window_height)
+
+
+def draw_segmented_stat_bar(x, y, w, h, value, max_value, color, window_width, window_height, active=True):
+    max_value = max(1, int(max_value))
+    value = max(0, min(max_value, int(value)))
+    gap = 3
+    segment_w = (w - gap * (max_value - 1)) / max_value
+    fill_color = color if active else tuple(c * 0.35 + 0.10 for c in color)
+
+    for i in range(max_value):
+        segment_x = x + i * (segment_w + gap)
+        segment_color = fill_color if i < value else (0.16, 0.17, 0.20)
+        draw_button(segment_x, y, segment_w, h, segment_color, window_width, window_height)
+
+
+def label_color(active):
+    return (0.92, 0.92, 0.90) if active else (0.36, 0.37, 0.40)
+
+
+def mouse_inside_rect(mouse_x, mouse_y, x, y, w, h):
+    return x <= mouse_x <= x + w and y <= mouse_y <= y + h
+
+
+def draw_action_label(label, acao, player_index, x, y, scale, active, window_width, window_height):
+    global action_hovered
+
+    mouse_x, mouse_y = glfw.get_cursor_pos(window)
+    text_w = get_text_width(label, scale)
+    text_h = 7 * scale
+    hovered = mouse_inside_rect(mouse_x, mouse_y, x, y, text_w, text_h)
+
+    draw_text(label, x, y, scale, label_color(active), window_width, window_height)
+    if hovered and active:
+        action_hovered = True
+        dash_w = 8
+        gap = 4
+        line_y = y + text_h / 2
+        dash_x = x
+        while dash_x < x + text_w:
+            draw_button(dash_x, line_y, min(dash_w, x + text_w - dash_x), 2, label_color(active), window_width, window_height)
+            dash_x += dash_w + gap
+
+    action_buttons.append({
+        "acao": acao,
+        "player_index": player_index,
+        "x": x,
+        "y": y,
+        "w": text_w,
+        "h": text_h + 4,
+        "active": active,
+    })
+
+
+def draw_personagem_info(x, y, w, personagem, window_width, window_height):
+    stats = personagem["stats"]
+    cor = personagem["color"]
+    player_index = personagem["player_index"]
+    roubo_disponivel = pode_roubar_contra_alvo(stats, personagem["team"])
+    defesa_disponivel = stats["defesa_pontos"] >= stats["defesa_max"] and pode_defender(personagem["team"])
+    card_h = 154 if stats["pode_roubar"] else 134
+
+    draw_button(x, y, w, card_h, (0.09, 0.10, 0.13), window_width, window_height)
+
+    nome_scale = 2
+    nome_x = x + 10 + 17 - get_text_width(personagem["name"], nome_scale) / 2
+    draw_text(personagem["name"], nome_x, y + 8, nome_scale, (0.88, 0.90, 0.95), window_width, window_height)
+    draw_button(x + 10, y + 30, 34, 34, cor, window_width, window_height)
+    draw_text(f"DANO {stats['dano']}", x + 5, y + 70, 1, (0.80, 0.82, 0.86), window_width, window_height)
+    if stats["pode_roubar"]:
+        draw_text(f"ROUBO {stats['roubo_moedas']}", x + 5, y + 80, 1, (0.80, 0.82, 0.86), window_width, window_height)
+
+    label_scale = 2
+    bar_x = x + 56
+    bar_w = w - 70
+    bars_y = y + 30
+
+    draw_action_label("1 ATACAR", "ataque", player_index, bar_x, bars_y, label_scale, pode_atacar(stats), window_width, window_height)
+    draw_segmented_stat_bar(bar_x, bars_y + 15, bar_w, 10, stats["ataque_pontos"], stats["ataque_max"], (1.00, 0.35, 0.25), window_width, window_height, pode_atacar(stats))
+
+    if stats["pode_roubar"]:
+        draw_action_label("2 ROUBAR", "roubo", player_index, bar_x, bars_y + 31, label_scale, roubo_disponivel, window_width, window_height)
+        draw_segmented_stat_bar(bar_x, bars_y + 46, bar_w, 10, stats["roubo_pontos"], stats["roubo_max"], (0.25, 0.75, 1.00), window_width, window_height, roubo_disponivel)
+        evolucao_y = bars_y + 62
+        evolucao_label = "3 EVOLUIR"
+        defesa_label = "4 DEFENDER"
+    else:
+        evolucao_y = bars_y + 31
+        evolucao_label = "2 EVOLUIR"
+        defesa_label = "3 DEFENDER"
+
+    draw_action_label(evolucao_label, "evolucao", player_index, bar_x, evolucao_y, label_scale, pode_evoluir(stats), window_width, window_height)
+    draw_segmented_stat_bar(bar_x, evolucao_y + 15, bar_w, 10, stats["evolucao_pontos"], stats["evolucao_max"], (0.85, 0.35, 1.00), window_width, window_height, pode_evoluir(stats))
+
+    defesa_y = evolucao_y + 31
+    draw_action_label(defesa_label, "defesa", player_index, bar_x, defesa_y, label_scale, defesa_disponivel, window_width, window_height)
+    draw_segmented_stat_bar(bar_x, defesa_y + 15, bar_w, 10, stats["defesa_pontos"], stats["defesa_max"], (0.65, 0.65, 0.70), window_width, window_height, defesa_disponivel)
+
+    return card_h
+
+
+def draw_player_panel(player_number, x, y, w, h, window_width, window_height):
+    painel = player_panels[player_number]
+
+    draw_button(x + 5, y + 5, w, h, (0.03, 0.03, 0.04), window_width, window_height)
+    draw_button(x, y, w, h, (0.06, 0.07, 0.09), window_width, window_height)
+
+    header_color = (0.20, 0.55, 1.00) if player_number == 1 else (1.00, 0.35, 0.35)
+    draw_button(x, y, w, 16, header_color, window_width, window_height)
+
+    item_y = y + 30
+    for personagem in painel["personagens"]:
+        item_h = draw_personagem_info(x + 12, item_y, w - 24, personagem, window_width, window_height)
+        item_y += item_h + 14
+
+    muro_y = y + h - 76
+    draw_button(x + 12, muro_y, w - 24, 66, (0.12, 0.13, 0.16), window_width, window_height)
+    draw_text("BARREIRA", x + 24, muro_y + 8, 2, (0.92, 0.92, 0.90), window_width, window_height)
+    draw_segmented_stat_bar(x + 24, muro_y + 24, w - 48, 10, painel["muro"], painel["muro_max"], (0.65, 0.65, 0.70), window_width, window_height)
+    draw_text("SACO MOEDAS", x + 24, muro_y + 40, 2, (0.92, 0.92, 0.90), window_width, window_height)
+    draw_segmented_stat_bar(x + 24, muro_y + 56, w - 48, 10, painel["saco_moedas"], painel["saco_moedas_max"], (1.00, 0.82, 0.20), window_width, window_height)
+
+
+def draw_status_panels(window_width, window_height):
+    normal_w = 230
+    normal_h = 455
+    active_w = 260
+    active_h = 500
+    normal_y = 88
+    active_y = 66
+
+    p1_w = active_w if jogador_turno == 1 else normal_w
+    p1_h = active_h if jogador_turno == 1 else normal_h
+    p1_y = active_y if jogador_turno == 1 else normal_y
+
+    p2_w = active_w if jogador_turno == 2 else normal_w
+    p2_h = active_h if jogador_turno == 2 else normal_h
+    p2_y = active_y if jogador_turno == 2 else normal_y
+
+    p1_x = 18
+    p2_x = window_width - p2_w - 18
+
+    draw_text("JOGADOR 1", p1_x + 8, p1_y - 24, 3, (0.0, 0.0, 0.0), window_width, window_height)
+    draw_text("JOGADOR 2", p2_x + p2_w - get_text_width("JOGADOR 2", 3) - 8, p2_y - 24, 3, (0.0, 0.0, 0.0), window_width, window_height)
+
+    draw_player_panel(1, p1_x, p1_y, p1_w, p1_h, window_width, window_height)
+    draw_player_panel(2, p2_x, p2_y, p2_w, p2_h, window_width, window_height)
+
+
+def mouse_inside_roleta(mouse_x, mouse_y):
+    roleta_tela_x = get_roleta_x(current_window_width)
+    return (
+        roleta_tela_x <= mouse_x <= roleta_tela_x + roleta_largura
+        and roleta_y <= mouse_y <= roleta_y + roleta_altura
+    )
+
+
+def pode_atacar(stats):
+    return stats["ataque_pontos"] >= stats["ataque_max"]
+
+
+def pode_roubar(stats):
+    return stats["pode_roubar"] and stats["roubo_pontos"] >= stats["roubo_max"]
+
+
+def pode_roubar_contra_alvo(stats, team):
+    if not pode_roubar(stats):
+        return False
+    alvo = player_adversario(team)
+    return not stats["roubo_requer_muro_destruido"] or player_panels[alvo]["muro"] == 0
+
+
+def pode_evoluir(stats):
+    return stats["evolucao_pontos"] >= stats["evolucao_max"]
+
+
+def adicionar_pontos_personagem(player_index, tipo, pontos):
+    stats = players[player_index]["stats"]
+
+    if tipo == "ataque":
+        stats["ataque_pontos"] = min(stats["ataque_max"], stats["ataque_pontos"] + pontos)
+    elif tipo == "roubo" and stats["pode_roubar"]:
+        stats["roubo_pontos"] = min(stats["roubo_max"], stats["roubo_pontos"] + pontos)
+    elif tipo == "evolucao":
+        stats["evolucao_pontos"] = min(stats["evolucao_max"], stats["evolucao_pontos"] + pontos)
+    elif tipo == "defesa":
+        stats["defesa_pontos"] = min(stats["defesa_max"], stats["defesa_pontos"] + pontos)
+
+    atualizar_painel_do_player(player_index)
+
+
+def evoluir_personagem(player_index):
+    stats = players[player_index]["stats"]
+
+    if not pode_evoluir(stats):
         return False
 
-    def _finalizar_turno(self):
-        """Passa o turno para o outro jogador e reseta a fase para nova roleta."""
-        turno_anterior = self.jogador_turno
-        self.jogador_turno = 1 - self.jogador_turno
-        self.fase_turno = "roleta"
-        self.resultados_roleta = []
-        self._aplicar_camera_turno()
-        self._registrar_evento(f"Turno finalizado: {turno_anterior} -> {self.jogador_turno} (fase=roleta)")
+    stats["evolucao_pontos"] = 0
+    stats["nivel"] += 1
+    stats["dano"] += 1
 
-    def iniciar_gl(self):
-        """Inicializa OpenGL, carrega shaders e cria as malhas."""
-        glEnable(GL_DEPTH_TEST)
-        glClearColor(0.82, 0.86, 0.91, 1.0)
+    atualizar_painel_do_player(player_index)
+    return True
 
-        aqui = os.path.dirname(os.path.abspath(__file__))
-        diretorio_shaders = os.path.join(aqui, "shaders")
 
-        self.id_shader = criar_programa_de_arquivos(
-            os.path.join(diretorio_shaders, "vertexShader.glsl"),
-            os.path.join(diretorio_shaders, "fragmentShader.glsl"),
-        )
+def atualizar_painel_do_player(player_index):
+    team = player_team[player_index]
+    slot = 0 if player_index in [0, 2] else 1
 
-        self.locais["projection"] = glGetUniformLocation(self.id_shader, "projection")
-        self.locais["view"] = glGetUniformLocation(self.id_shader, "view")
-        self.locais["model"] = glGetUniformLocation(self.id_shader, "model")
-        self.locais["objectColor"] = glGetUniformLocation(self.id_shader, "objectColor")
-        self.locais["lightColor"] = glGetUniformLocation(self.id_shader, "lightColor")
-        self.locais["lightPos"] = glGetUniformLocation(self.id_shader, "lightPos")
-        self.locais["viewPos"] = glGetUniformLocation(self.id_shader, "viewPos")
+    player_panels[team]["personagens"][slot] = {
+        "name": players[player_index]["name"],
+        "color": players[player_index]["color"],
+        "stats": players[player_index]["stats"],
+        "team": team,
+        "player_index": player_index,
+    }
 
-        self.cubo = MalhaCubo()
-        self.esfera = MalhaEsfera()
-        self.barreira = MalhaBarreiraCurva()
 
-    def atualizar_framebuffer(self, janela, largura: int, altura: int):
-        """Atualiza o viewport quando a janela é redimensionada."""
-        self.resolucao = [largura, altura]
-        glViewport(0, 0, largura, altura)
-        self._registrar_evento(f"Janela redimensionada: {largura}x{altura}")
+def player_adversario(player_number):
+    return 2 if player_number == 1 else 1
 
-    def _tecla_pressionada(self, janela, tecla: int) -> bool:
-        """Detecta borda de subida (pressionou agora, não estava pressionada antes)."""
-        tecla_glfw = tecla
-        esta_pressionada = glfw.get_key(janela, tecla_glfw) == glfw.PRESS
-        estava_pressionada = self._estado_tecla_anterior.get(tecla_glfw, False)
-        self._estado_tecla_anterior[tecla_glfw] = esta_pressionada
-        if esta_pressionada and not estava_pressionada:
-            if self.modo == "jogando":
-                self._registrar_evento(
-                    f"Tecla: {self._nome_tecla(tecla_glfw)} (modo=jogando turno={self.jogador_turno} fase={self.fase_turno})"
-                )
-            else:
-                self._registrar_evento(f"Tecla: {self._nome_tecla(tecla_glfw)} (modo=selecao)")
-        return esta_pressionada and not estava_pressionada
 
-    def atualizar(self, janela, delta_tempo: float):
-        """
-        Atualiza a lógica do jogo (entrada + estado).
-        """
-        if self._tecla_pressionada(janela, glfw.KEY_ESCAPE):
-            self._registrar_evento("Saindo (ESC)")
-            glfw.set_window_should_close(janela, True)
-            return
+def atacar_muro(player_number, dano):
+    alvo = player_adversario(player_number)
+    player_panels[alvo]["muro"] = max(0, player_panels[alvo]["muro"] - dano)
+    return player_panels[alvo]["muro"] == 0
 
-        if self.modo == "selecao":
-            # Navegação na lista de campeões.
-            if self._tecla_pressionada(janela, glfw.KEY_LEFT):
-                self.indice_campeao_selecionado = (self.indice_campeao_selecionado - 1) % len(self.opcoes_campeoes)
-                selecionado = self.opcoes_campeoes[self.indice_campeao_selecionado]
-                self._registrar_evento(f"Seleção: {selecionado['nome']} (indice={self.indice_campeao_selecionado})")
-            if self._tecla_pressionada(janela, glfw.KEY_RIGHT):
-                self.indice_campeao_selecionado = (self.indice_campeao_selecionado + 1) % len(self.opcoes_campeoes)
-                selecionado = self.opcoes_campeoes[self.indice_campeao_selecionado]
-                self._registrar_evento(f"Seleção: {selecionado['nome']} (indice={self.indice_campeao_selecionado})")
 
-            for i in range(4):
-                if self._tecla_pressionada(janela, glfw.KEY_1 + i):
-                    self.indice_campeao_selecionado = i
-                    selecionado = self.opcoes_campeoes[self.indice_campeao_selecionado]
-                    self._registrar_evento(f"Seleção: {selecionado['nome']} (tecla={i+1})")
+def atacar_saco_moedas(player_number, dano):
+    alvo = player_adversario(player_number)
+    player_panels[alvo]["saco_moedas"] = max(0, player_panels[alvo]["saco_moedas"] - dano)
+    return player_panels[alvo]["saco_moedas"] == 0
 
-            # Desfazer seleção atual (volta slot/time).
-            if self._tecla_pressionada(janela, glfw.KEY_BACKSPACE):
-                if self._time_selecionando != 0 or self._slot_selecionando != 0:
-                    if self._slot_selecionando == 1:
-                        self._slot_selecionando = 0
-                        self._indices_campeoes_escolhidos[self._time_selecionando][1] = None
-                        self._registrar_evento(f"Desfazer: voltou para slot=0 (time={self._time_selecionando})")
-                    else:
-                        self._time_selecionando = 0
-                        self._slot_selecionando = 1
-                        self._indices_campeoes_escolhidos[1][0] = None
-                        self._registrar_evento("Desfazer: voltou para time=0 slot=1")
 
-            # Confirmar escolha do campeão atual para o slot selecionado.
-            if self._tecla_pressionada(janela, glfw.KEY_ENTER) or self._tecla_pressionada(janela, glfw.KEY_SPACE):
-                ja_escolhido = any(
-                    self.indice_campeao_selecionado == idx
-                    for idx in self._indices_campeoes_escolhidos[self._time_selecionando]
-                    if idx is not None
-                )
-                if ja_escolhido:
-                    selecionado = self.opcoes_campeoes[self.indice_campeao_selecionado]
-                    self._registrar_evento(
-                        f"Escolha ignorada (já escolhido no time atual): {selecionado['nome']} (time={self._time_selecionando})"
-                    )
-                    return
+def roubar_moedas(player_number, quantidade):
+    alvo = player_adversario(player_number)
+    roubado = min(quantidade, player_panels[alvo]["saco_moedas"])
+    player_panels[alvo]["saco_moedas"] -= roubado
+    player_panels[player_number]["saco_moedas"] = min(
+        player_panels[player_number]["saco_moedas_max"],
+        player_panels[player_number]["saco_moedas"] + roubado
+    )
+    return player_panels[alvo]["saco_moedas"] == 0
 
-                self._indices_campeoes_escolhidos[self._time_selecionando][self._slot_selecionando] = (
-                    self.indice_campeao_selecionado
-                )
-                escolhido = self.opcoes_campeoes[self.indice_campeao_selecionado]
-                self._registrar_evento(
-                    f"Escolhido: {escolhido['nome']} (time={self._time_selecionando} slot={self._slot_selecionando})"
-                )
-                if self._time_selecionando == 0 and self._slot_selecionando == 0:
-                    self._slot_selecionando = 1
-                    self._registrar_evento("Avançar seleção: time=0 slot=1")
-                elif self._time_selecionando == 0 and self._slot_selecionando == 1:
-                    self._time_selecionando = 1
-                    self._slot_selecionando = 0
-                    self._registrar_evento("Avançar seleção: time=1 slot=0")
-                elif self._time_selecionando == 1 and self._slot_selecionando == 0:
-                    self._slot_selecionando = 1
-                    self._registrar_evento("Avançar seleção: time=1 slot=1")
-                else:
-                    # Quando os 4 campeões foram escolhidos, configura as cores/estados e inicia a partida.
-                    escolhido_p1_a = self.opcoes_campeoes[self._indices_campeoes_escolhidos[0][0]]
-                    escolhido_p1_b = self.opcoes_campeoes[self._indices_campeoes_escolhidos[0][1]]
-                    escolhido_p2_a = self.opcoes_campeoes[self._indices_campeoes_escolhidos[1][0]]
-                    escolhido_p2_b = self.opcoes_campeoes[self._indices_campeoes_escolhidos[1][1]]
-                    self._registrar_evento(
-                        "Seleção concluída | "
-                        f"P1={escolhido_p1_a['nome']}/{escolhido_p1_b['nome']} "
-                        f"P2={escolhido_p2_a['nome']}/{escolhido_p2_b['nome']}"
-                    )
 
-                    self._reiniciar_estado_partida()
-                    self.jogadores[self._slots_jogadores_time[0][0]]["cor"] = escolhido_p1_a["cor"]
-                    self.jogadores[self._slots_jogadores_time[0][1]]["cor"] = escolhido_p1_b["cor"]
-                    self.jogadores[self._slots_jogadores_time[1][0]]["cor"] = escolhido_p2_a["cor"]
-                    self.jogadores[self._slots_jogadores_time[1][1]]["cor"] = escolhido_p2_b["cor"]
+def verificar_vencedor_por_moedas():
+    if player_panels[1]["saco_moedas"] <= 0:
+        return 2
+    if player_panels[2]["saco_moedas"] <= 0:
+        return 1
+    return None
 
-                    self.campeoes[self._slots_jogadores_time[0][0]] = self._iniciar_estado_campeao(escolhido_p1_a["tipo"])
-                    self.campeoes[self._slots_jogadores_time[0][1]] = self._iniciar_estado_campeao(escolhido_p1_b["tipo"])
-                    self.campeoes[self._slots_jogadores_time[1][0]] = self._iniciar_estado_campeao(escolhido_p2_a["tipo"])
-                    self.campeoes[self._slots_jogadores_time[1][1]] = self._iniciar_estado_campeao(escolhido_p2_b["tipo"])
 
-                    self.modo = "jogando"
-                    self._registrar_evento("Modo alterado: selecao -> jogando")
-                    return
+def pode_defender(player_number):
+    return player_panels[player_number]["muro"] < player_panels[player_number]["muro_max"]
 
-            return
 
-        if self.modo == "jogando":
-            # Voltar para a seleção (recomeçar).
-            if self._tecla_pressionada(janela, glfw.KEY_BACKSPACE):
-                self._registrar_evento("Voltar para seleção (BACKSPACE)")
-                self.modo = "selecao"
-                self._time_selecionando = 0
-                self._slot_selecionando = 0
-                self._indices_campeoes_escolhidos = [[None, None], [None, None]]
-                return
+def evoluir_barreira(player_index):
+    stats = players[player_index]["stats"]
+    team = player_team[player_index]
 
-            # Condição de término: um dos lados ficou sem moedas.
-            if self.moedas_time[0] <= 0 or self.moedas_time[1] <= 0:
-                if not self._partida_finalizada:
-                    if self.moedas_time[0] <= 0 and self.moedas_time[1] <= 0:
-                        vencedor = None
-                    else:
-                        vencedor = 1 if self.moedas_time[0] <= 0 else 0
-                    self.vencedor_time = vencedor
-                    self._registrar_evento(
-                        f"Fim de partida: vencedor={'empate' if vencedor is None else f'time {vencedor}'} | {self._resumo_time(0)} | {self._resumo_time(1)}"
-                    )
-                    self._partida_finalizada = True
-                return
+    if stats["defesa_pontos"] < stats["defesa_max"] or not pode_defender(team):
+        return False
 
-            # Fase visual do giro (mostra cores alternando no tablet).
-            if self.roleta_girando:
-                self.tempo_roleta += delta_tempo
-                cor_esquerda = self.jogadores[self._indice_jogador_time_lado(self.jogador_turno, 0)]["cor"]
-                cor_direita = self.jogadores[self._indice_jogador_time_lado(self.jogador_turno, 1)]["cor"]
-                cor_muro = (0.55, 0.55, 0.55)
-                cores = [cor_esquerda, cor_direita, cor_muro]
-                self.resultados_roleta = [("giro", cores[random.randint(0, 2)]) for _ in range(5)]
-                if self.tempo_roleta >= self.duracao_giro_roleta:
-                    self.roleta_girando = False
-                    self._finalizar_roleta()
+    stats["defesa_pontos"] = 0
+    player_panels[team]["muro_max"] = 5
+    player_panels[team]["muro"] = min(player_panels[team]["muro_max"], player_panels[team]["muro"] + 2)
+    atualizar_painel_do_player(player_index)
+    return True
 
-            if not self.roleta_girando:
-                # Alterna entre roleta e fase de ação.
-                if self.fase_turno == "roleta":
-                    self._registrar_evento(f"Iniciar roleta (turno={self.jogador_turno})")
-                    self._iniciar_giro_roleta()
-                elif self.fase_turno == "acao":
-                    if self._tecla_pressionada(janela, glfw.KEY_P) or self._tecla_pressionada(janela, glfw.KEY_0):
-                        self._registrar_evento(f"Ação solicitada: pular turno (turno={self.jogador_turno})")
-                        self._finalizar_turno()
-                        return
 
-                    action_done = False
-                    acao_tentada = None
-                    # Mapeamento das teclas 1..7 para ações.
-                    if self._tecla_pressionada(janela, glfw.KEY_1):
-                        acao_tentada = "ataque esquerda"
-                        self._registrar_evento(f"Ação solicitada: {acao_tentada} (turno={self.jogador_turno})")
-                        action_done = self._executar_ataque(0)
-                    elif self._tecla_pressionada(janela, glfw.KEY_2):
-                        acao_tentada = "ataque direita"
-                        self._registrar_evento(f"Ação solicitada: {acao_tentada} (turno={self.jogador_turno})")
-                        action_done = self._executar_ataque(1)
-                    elif self._tecla_pressionada(janela, glfw.KEY_3):
-                        acao_tentada = "evoluir esquerda"
-                        self._registrar_evento(f"Ação solicitada: {acao_tentada} (turno={self.jogador_turno})")
-                        action_done = self._executar_evolucao(0)
-                    elif self._tecla_pressionada(janela, glfw.KEY_4):
-                        acao_tentada = "evoluir direita"
-                        self._registrar_evento(f"Ação solicitada: {acao_tentada} (turno={self.jogador_turno})")
-                        action_done = self._executar_evolucao(1)
-                    elif self._tecla_pressionada(janela, glfw.KEY_5):
-                        acao_tentada = "roubo esquerda"
-                        self._registrar_evento(f"Ação solicitada: {acao_tentada} (turno={self.jogador_turno})")
-                        action_done = self._executar_roubo(0)
-                    elif self._tecla_pressionada(janela, glfw.KEY_6):
-                        acao_tentada = "roubo direita"
-                        self._registrar_evento(f"Ação solicitada: {acao_tentada} (turno={self.jogador_turno})")
-                        action_done = self._executar_roubo(1)
-                    elif self._tecla_pressionada(janela, glfw.KEY_7):
-                        acao_tentada = "defesa/muro"
-                        self._registrar_evento(f"Ação solicitada: {acao_tentada} (turno={self.jogador_turno})")
-                        action_done = self._executar_defesa()
+def executar_acao_personagem(player_index, acao):
+    # Aplica a regra da acao escolhida e informa se o turno foi consumido.
+    global vencedor
 
-                    if action_done:
-                        self._registrar_evento(
-                            "Ação executada com sucesso | "
-                            f"{self._resumo_time(0)} | {self._resumo_time(1)}"
-                        )
-                        self._finalizar_turno()
-                    else:
-                        if acao_tentada is not None:
-                            self._registrar_evento(
-                                f"Ação falhou: {acao_tentada} (requisitos não atendidos) | "
-                                f"{self._resumo_time(self.jogador_turno)}"
-                            )
+    if player_index is None:
+        return False
 
-    def _definir_uniformes_objeto(self, matriz_modelo: glm.mat4, cor):
-        """Atualiza uniforms do objeto atual (matriz de modelo e cor)."""
-        glUniformMatrix4fv(self.locais["model"], 1, GL_FALSE, glm.value_ptr(matriz_modelo))
-        glUniform3f(self.locais["objectColor"], *cor)
+    if player_team[player_index] != jogador_turno:
+        return False
 
-    def desenhar_cubo(self, posicao: glm.vec3, escala: glm.vec3, cor, rotacao_y: float = 0.0):
-        """Desenha um cubo com transformação e cor."""
-        model = glm.mat4(1.0)
-        model = glm.translate(model, posicao)
-        model = glm.rotate(model, glm.radians(rotacao_y), glm.vec3(0, 1, 0))
-        model = glm.scale(model, escala)
-        self._definir_uniformes_objeto(model, cor)
-        self.cubo.desenhar()
+    stats = players[player_index]["stats"]
+    team = player_team[player_index]
 
-    def desenhar_esfera(self, posicao: glm.vec3, escala: float, cor):
-        """Desenha uma esfera com transformação e cor."""
-        model = glm.mat4(1.0)
-        model = glm.translate(model, posicao)
-        model = glm.scale(model, glm.vec3(escala))
-        self._definir_uniformes_objeto(model, cor)
-        self.esfera.desenhar()
+    if acao == "ataque":
+        if not pode_atacar(stats):
+            return False
 
-    def desenhar_barreira(self, posicao: glm.vec3, cor, rotacao_y: float = 0.0):
-        """Desenha a barreira curva (muro) com rotação e cor."""
-        model = glm.mat4(1.0)
-        model = glm.translate(model, posicao)
-        model = glm.rotate(model, glm.radians(rotacao_y), glm.vec3(0, 1, 0))
-        self._definir_uniformes_objeto(model, cor)
-        self.barreira.desenhar()
+        stats["ataque_pontos"] = 0
+        alvo = player_adversario(team)
+        if stats["ataque_requer_muro_destruido"] and player_panels[alvo]["muro"] > 0:
+            atacar_muro(team, stats["dano"])
+            atualizar_painel_do_player(player_index)
+            return True
 
-    def _desenhar_tablet_e_roleta(self):
-        """Desenha o tablet 3D com os 5 resultados da roleta (ou estado de giro)."""
-        time = self.jogador_turno
-        z_atras = -12.0 if time == 0 else 12.0
-        z_direcao_camera = 0.35 if time == 0 else -0.35
+        venceu = atacar_saco_moedas(team, stats["dano"])
+        atualizar_painel_do_player(player_index)
+        if venceu:
+            vencedor = team
+        return True
 
-        cor_tablet = (0.12, 0.12, 0.14)
-        cor_moldura = (0.25, 0.25, 0.27)
-        self.desenhar_cubo(glm.vec3(0, 2.6, z_atras), glm.vec3(5.0, 2.8, 0.18), cor_moldura)
-        self.desenhar_cubo(
-            glm.vec3(0, 2.6, z_atras + z_direcao_camera * 0.15),
-            glm.vec3(4.6, 2.5, 0.12),
-            cor_tablet,
-        )
+    if acao == "roubo":
+        if not pode_roubar_contra_alvo(stats, team):
+            return False
 
-        x_pinos = [-1.6, -0.8, 0.0, 0.8, 1.6]
-        y = 2.6
-        z = z_atras + z_direcao_camera
+        stats["roubo_pontos"] = 0
+        venceu = roubar_moedas(team, stats["roubo_moedas"])
+        atualizar_painel_do_player(player_index)
+        if venceu:
+            vencedor = team
+        return True
 
-        if self.resultados_roleta:
-            cores_pinos = [pip[1] for pip in self.resultados_roleta[:5]]
+    if acao == "evolucao":
+        return evoluir_personagem(player_index)
+
+    if acao == "defesa":
+        return evoluir_barreira(player_index)
+
+    return False
+
+
+def finalizar_turno_apos_acao():
+    global jogador_turno
+    global selected_action_player
+
+    jogador_turno = player_adversario(jogador_turno)
+    selected_action_player = None
+    atualizar_camera_por_turno()
+
+
+def handle_action_click(mouse_x, mouse_y):
+    if selected_action_player is None:
+        return False
+
+    for action_button in action_buttons:
+        if not mouse_inside_rect(mouse_x, mouse_y, action_button["x"], action_button["y"], action_button["w"], action_button["h"]):
+            continue
+        if action_button["player_index"] != selected_action_player or not action_button["active"]:
+            return True
+        if executar_acao_personagem(selected_action_player, action_button["acao"]):
+            if vencedor is None:
+                finalizar_turno_apos_acao()
+            return True
+        return True
+
+    return False
+
+
+def verificar_teclas_de_acao():
+    global action_key_1_last
+    global action_key_2_last
+    global action_key_3_last
+    global action_key_4_last
+
+    key_1 = glfw.get_key(window, glfw.KEY_1) == glfw.PRESS
+    key_2 = glfw.get_key(window, glfw.KEY_2) == glfw.PRESS
+    key_3 = glfw.get_key(window, glfw.KEY_3) == glfw.PRESS
+    key_4 = glfw.get_key(window, glfw.KEY_4) == glfw.PRESS
+    fez_acao = False
+
+    if key_1 and not action_key_1_last:
+        fez_acao = executar_acao_personagem(selected_action_player, "ataque")
+
+    if not fez_acao and key_2 and not action_key_2_last:
+        if selected_action_player is not None and players[selected_action_player]["stats"]["pode_roubar"]:
+            fez_acao = executar_acao_personagem(selected_action_player, "roubo")
         else:
-            cores_pinos = [(0.18, 0.18, 0.2)] * 5
+            fez_acao = executar_acao_personagem(selected_action_player, "evolucao")
 
-        for i in range(5):
-            self.desenhar_cubo(glm.vec3(x_pinos[i], y, z), glm.vec3(0.28, 0.28, 0.08), cores_pinos[i])
+    if not fez_acao and key_3 and not action_key_3_last:
+        if selected_action_player is not None and players[selected_action_player]["stats"]["pode_roubar"]:
+            fez_acao = executar_acao_personagem(selected_action_player, "evolucao")
+        else:
+            fez_acao = executar_acao_personagem(selected_action_player, "defesa")
 
-    def _desenhar_colunas_recursos(self):
-        """Desenha colunas que representam pontos de ataque (esq/dir) e pontos de muro."""
-        cor_muro = (0.55, 0.55, 0.55)
-        for time in (0, 1):
-            z_dir = -1.0 if time == 0 else 1.0
-            indice_esquerda = self._indice_jogador_time_lado(time, 0)
-            indice_direita = self._indice_jogador_time_lado(time, 1)
+    if not fez_acao and key_4 and not action_key_4_last:
+        if selected_action_player is not None and players[selected_action_player]["stats"]["pode_roubar"]:
+            fez_acao = executar_acao_personagem(selected_action_player, "defesa")
 
-            pontos_esquerda = self.pontos_time[time]["esquerda"]
-            pontos_direita = self.pontos_time[time]["direita"]
-            pontos_muro = self.pontos_time[time]["muro"]
+    if fez_acao and vencedor is None:
+        finalizar_turno_apos_acao()
 
-            pos_esquerda = self.jogadores[indice_esquerda]["posicao"] + glm.vec3(0, 0.0, z_dir * 1.4)
-            pos_direita = self.jogadores[indice_direita]["posicao"] + glm.vec3(0, 0.0, z_dir * 1.4)
-            pos_barreira = self._recursos_time(time)["pos_barreira"] + glm.vec3(0, 0.0, z_dir * 0.9)
+    action_key_1_last = key_1
+    action_key_2_last = key_2
+    action_key_3_last = key_3
+    action_key_4_last = key_4
 
-            h_esquerda = 0.12 + min(pontos_esquerda, 30) * 0.08
-            h_direita = 0.12 + min(pontos_direita, 30) * 0.08
-            h_muro = 0.12 + min(pontos_muro, 30) * 0.08
 
-            self.desenhar_cubo(
-                glm.vec3(pos_esquerda.x, h_esquerda / 2.0, pos_esquerda.z),
-                glm.vec3(0.18, h_esquerda, 0.18),
-                self.jogadores[indice_esquerda]["cor"],
-            )
-            self.desenhar_cubo(
-                glm.vec3(pos_direita.x, h_direita / 2.0, pos_direita.z),
-                glm.vec3(0.18, h_direita, 0.18),
-                self.jogadores[indice_direita]["cor"],
-            )
-            self.desenhar_cubo(glm.vec3(pos_barreira.x, h_muro / 2.0, pos_barreira.z), glm.vec3(0.18, h_muro, 0.18), cor_muro)
+def sortear_roleta_resultados():
+    return [random.choice(roleta_tipos) for _ in range(5)]
 
-    def _desenhar_forca_muro(self):
-        """Desenha uma barra acima da barreira indicando a vida do muro do time."""
-        for time in (0, 1):
-            vida_muro = self.vida_muro_time[time]
-            if vida_muro <= 0:
-                continue
-            recursos = self._recursos_time(time)
-            direcao_z = -1.0 if time == 0 else 1.0
-            altura = 0.12 + min(vida_muro, 40) * 0.05
-            posicao = recursos["pos_barreira"] + glm.vec3(0, altura / 2.0 + 0.45, direcao_z * 0.2)
-            self.desenhar_cubo(glm.vec3(posicao.x, posicao.y, posicao.z), glm.vec3(0.5, altura, 0.5), (0.55, 0.55, 0.55))
 
-    def _iniciar_cena(self, visao: glm.mat4, projecao: glm.mat4, posicao_camera: glm.vec3):
-        """Configura a cena (limpa buffers, usa shader e define uniforms globais)."""
+def iniciar_roleta(tempo_atual):
+    global roleta_girando
+    global roleta_fim_tempo
+    global roleta_proximo_tick
+    global roleta_resultados
+
+    roleta_girando = True
+    roleta_fim_tempo = tempo_atual + 1.25
+    roleta_proximo_tick = tempo_atual
+    roleta_resultados = sortear_roleta_resultados()
+
+
+def atualizar_roleta(tempo_atual):
+    global roleta_girando
+    global roleta_proximo_tick
+    global roleta_resultados
+    global jogador_turno
+    global selected_action_player
+
+    if not roleta_girando:
+        return
+
+    if tempo_atual >= roleta_proximo_tick:
+        roleta_resultados = sortear_roleta_resultados()
+        roleta_proximo_tick = tempo_atual + 0.08
+
+    if tempo_atual >= roleta_fim_tempo:
+        roleta_girando = False
+        roleta_resultados = sortear_roleta_resultados()
+        aplicar_resultado_roleta(jogador_turno)
+        jogador_turno = player_adversario(jogador_turno)
+        selected_action_player = None
+        atualizar_camera_por_turno()
+
+
+def aplicar_resultado_roleta(player_number):
+    player_indices = [i for i, team in enumerate(player_team) if team == player_number]
+
+    for resultado in roleta_resultados:
+        if resultado == "ataque":
+            for index in player_indices:
+                adicionar_pontos_personagem(index, "ataque", 1)
+
+        elif resultado == "roubo":
+            for index in player_indices:
+                adicionar_pontos_personagem(index, "roubo", 1)
+
+        elif resultado == "evolucao":
+            for index in player_indices:
+                adicionar_pontos_personagem(index, "evolucao", 1)
+
+        elif resultado == "barreira":
+            for index in player_indices:
+                adicionar_pontos_personagem(index, "defesa", 1)
+
+
+def atualizar_camera_por_turno():
+    global camera_target_angle
+    global camera_angle
+
+    if jogador_turno == 1:
+        camera_target_angle = CAMERA_ANGLE
+    else:
+        camera_target_angle = 0.0
+    camera_angle = camera_target_angle
+
+
+def get_selection_options(window_width, window_height):
+    option_size = 110
+    gap = 34
+    total_width = option_size * 4 + gap * 3
+    start_x = (window_width - total_width) / 2
+    y = window_height / 2 - option_size / 2
+
+    options = []
+    for i, color in enumerate(player_colors):
+        options.append({
+            "index": i,
+            "x": start_x + i * (option_size + gap),
+            "y": y,
+            "w": option_size,
+            "h": option_size,
+            "color": color,
+        })
+
+    return options
+
+
+def is_player_selected(index):
+    return False
+
+
+def aplicar_selecao_players():
+    global player_panels
+
+    player_slots = [
+        {"pos": glm.vec3(4.62, 0.5, -12.88), "team": 1},
+        {"pos": glm.vec3(-4.31, 0.5, -12.76), "team": 1},
+        {"pos": glm.vec3(-4.49, 0.5, 12.56), "team": 2},
+        {"pos": glm.vec3(4.47, 0.5, 12.60), "team": 2},
+    ]
+
+    ordem_escolhida = jogador1_selecao + jogador2_selecao
+
+    for slot, escolha in enumerate(ordem_escolhida):
+        players[slot]["pos"] = glm.vec3(player_slots[slot]["pos"])
+        players[slot]["color"] = player_colors[escolha]
+        players[slot]["name"] = player_names[escolha]
+        players[slot]["personagem"] = escolha
+        players[slot]["stats"] = dict(personagem_stats[escolha])
+        player_team[slot] = player_slots[slot]["team"]
+
+    player_panels[1]["personagens"] = [
+        {"name": players[0]["name"], "color": players[0]["color"], "stats": players[0]["stats"], "team": 1, "player_index": 0},
+        {"name": players[1]["name"], "color": players[1]["color"], "stats": players[1]["stats"], "team": 1, "player_index": 1},
+    ]
+    player_panels[2]["personagens"] = [
+        {"name": players[2]["name"], "color": players[2]["color"], "stats": players[2]["stats"], "team": 2, "player_index": 2},
+        {"name": players[3]["name"], "color": players[3]["color"], "stats": players[3]["stats"], "team": 2, "player_index": 3},
+    ]
+
+
+def draw_selection_screen(window_width, window_height):
+    draw_button(0, 0, window_width, window_height, (0.08, 0.09, 0.11), window_width, window_height)
+
+    for option in get_selection_options(window_width, window_height):
+        index = option["index"]
+        if jogador_selecionando == 1:
+            border_color = (0.20, 0.55, 1.00)
+        elif jogador_selecionando == 2:
+            border_color = (1.00, 0.35, 0.35)
+        else:
+            border_color = (0.72, 0.74, 0.78)
+
+        nome = player_names[index]
+        nome_scale = 3
+        nome_x = option["x"] + option["w"] / 2 - get_text_width(nome, nome_scale) / 2
+        draw_text(nome, nome_x, option["y"] - 34, nome_scale, (0.88, 0.90, 0.95), window_width, window_height)
+
+        draw_button(option["x"] - 8, option["y"] - 8, option["w"] + 16, option["h"] + 16, border_color, window_width, window_height)
+        draw_button(option["x"], option["y"], option["w"], option["h"], option["color"], window_width, window_height)
+
+    slot_w = 72
+    slot_h = 44
+    slot_gap = 18
+    group_w = slot_w * 2 + slot_gap
+    j1_x = window_width / 2 - group_w - 80
+    j2_x = window_width / 2 + 80
+    slot_y = window_height - 115
+    label_scale = 2
+    draw_text("JOGADOR 1", j1_x + group_w / 2 - get_text_width("JOGADOR 1", label_scale) / 2, slot_y - 28, label_scale, (0.88, 0.90, 0.95), window_width, window_height)
+    draw_text("JOGADOR 2", j2_x + group_w / 2 - get_text_width("JOGADOR 2", label_scale) / 2, slot_y - 28, label_scale, (0.88, 0.90, 0.95), window_width, window_height)
+
+    for slot in range(2):
+        color = player_colors[jogador1_selecao[slot]] if slot < len(jogador1_selecao) else (0.18, 0.20, 0.24)
+        draw_button(j1_x + slot * (slot_w + slot_gap), slot_y, slot_w, slot_h, color, window_width, window_height)
+
+        color = player_colors[jogador2_selecao[slot]] if slot < len(jogador2_selecao) else (0.18, 0.20, 0.24)
+        draw_button(j2_x + slot * (slot_w + slot_gap), slot_y, slot_w, slot_h, color, window_width, window_height)
+
+
+def handle_selection_click(mouse_x, mouse_y):
+    global tela_atual
+    global jogador_selecionando
+
+    for option in get_selection_options(current_window_width, current_window_height):
+        inside_x = option["x"] <= mouse_x <= option["x"] + option["w"]
+        inside_y = option["y"] <= mouse_y <= option["y"] + option["h"]
+
+        if not (inside_x and inside_y):
+            continue
+
+        index = option["index"]
+        if jogador_selecionando == 1:
+            jogador1_selecao.append(index)
+            if len(jogador1_selecao) == 2:
+                jogador_selecionando = 2
+        else:
+            jogador2_selecao.append(index)
+            if len(jogador2_selecao) == 2:
+                aplicar_selecao_players()
+                atualizar_camera_por_turno()
+                tela_atual = "tabuleiro"
+
+        return
+
+
+def draw_button(x, y, w, h, color, window_width, window_height):
+    # Retangulo 2D usado nos paineis, barras, roleta e overlays.
+    glUseProgram(button_shader)
+    left, top = to_ndc(x, y, window_width, window_height)
+    right, bottom = to_ndc(x + w, y + h, window_width, window_height)
+
+    r, g, b = color
+
+    vertices = np.array([
+        left,  bottom, r, g, b,
+        right, bottom, r, g, b,
+        right, top,    r, g, b,
+
+        left,  bottom, r, g, b,
+        right, top,    r, g, b,
+        left,  top,    r, g, b,
+    ], dtype=np.float32)
+
+    glBindBuffer(GL_ARRAY_BUFFER, button_vbo)
+    glBufferSubData(GL_ARRAY_BUFFER, 0, vertices.nbytes, vertices)
+
+    glBindVertexArray(button_vao)
+    glDrawArrays(GL_TRIANGLES, 0, 6)
+
+
+def draw_text(text, x, y, scale, color, window_width, window_height):
+    text_renderer.draw(text, x, y, scale, color, window_width, window_height)
+
+
+def draw_centered_text(text, y, scale, color, window_width, window_height):
+    draw_text(text, window_width / 2 - get_text_width(text, scale) / 2, y, scale, color, window_width, window_height)
+
+
+def draw_game_over(window_width, window_height):
+    if vencedor is None:
+        return
+
+    draw_button(0, 0, window_width, window_height, (0.02, 0.02, 0.03), window_width, window_height)
+    draw_centered_text("GAME OVER", window_height / 2 - 75, 7, (1.00, 0.25, 0.20), window_width, window_height)
+    draw_centered_text(f"PLAYER {vencedor} GANHOU", window_height / 2 + 10, 4, (0.92, 0.92, 0.90), window_width, window_height)
+
+
+def get_text_width(text, scale):
+    return text_renderer.measure(text, scale)
+
+
+def clamp_to_board(pos):
+    pos.x = max(-(board_half_width - 1.0), min(board_half_width - 1.0, pos.x))
+    pos.z = max(-(board_top_length - 1.0), min(board_bottom_length - 1.0, pos.z))
+    return pos
+
+
+def mouse_to_world_on_plane(mouse_x, mouse_y, plane_y):
+    if current_view is None or current_projection is None:
+        return None
+
+    x = (2.0 * mouse_x) / current_window_width - 1.0
+    y = 1.0 - (2.0 * mouse_y) / current_window_height
+
+    ray_clip_near = glm.vec4(x, y, -1.0, 1.0)
+    ray_clip_far = glm.vec4(x, y, 1.0, 1.0)
+
+    inverse_matrix = glm.inverse(current_projection * current_view)
+
+    world_near = inverse_matrix * ray_clip_near
+    world_far = inverse_matrix * ray_clip_far
+
+    world_near /= world_near.w
+    world_far /= world_far.w
+
+    ray_origin = glm.vec3(world_near)
+    ray_end = glm.vec3(world_far)
+    ray_dir = glm.normalize(ray_end - ray_origin)
+
+    if abs(ray_dir.y) < 0.0001:
+        return None
+
+    distance = (plane_y - ray_origin.y) / ray_dir.y
+
+    if distance < 0:
+        return None
+
+    return ray_origin + ray_dir * distance
+
+
+def get_draggable_objects():
+    objects = []
+
+    if blue_bag["carrier"] is None:
+        objects.append({
+            "kind": "blue_bag",
+            "index": None,
+            "pos": blue_bag["pos"],
+            "radius": 0.8,
+            "plane_y": 0.4,
+        })
+
+    if red_bag["carrier"] is None:
+        objects.append({
+            "kind": "red_bag",
+            "index": None,
+            "pos": red_bag["pos"],
+            "radius": 0.8,
+            "plane_y": 0.4,
+        })
+
+    if player_panels[1]["muro"] > 0:
+        objects.append({"kind": "red_barrier", "index": None, "pos": red_barrier_pos, "radius": 2.8, "plane_y": 0.05})
+    if player_panels[2]["muro"] > 0:
+        objects.append({"kind": "blue_barrier", "index": None, "pos": blue_barrier_pos, "radius": 2.8, "plane_y": 0.05})
+
+    return objects
+
+
+def get_clicked_player(mouse_x, mouse_y):
+    nearest_index = None
+    nearest_distance = 999999.0
+
+    for index, player in enumerate(players):
+        world_pos = mouse_to_world_on_plane(mouse_x, mouse_y, 0.5)
+        if world_pos is None:
+            continue
+
+        dx = world_pos.x - player["pos"].x
+        dz = world_pos.z - player["pos"].z
+        distance = math.sqrt(dx * dx + dz * dz)
+
+        if distance < 0.9 and distance < nearest_distance:
+            nearest_index = index
+            nearest_distance = distance
+
+    return nearest_index
+
+
+def set_object_position(kind, index, new_pos):
+    global blue_barrier_pos
+    global red_barrier_pos
+
+    new_pos = clamp_to_board(new_pos)
+
+    if kind == "blue_bag":
+        blue_bag["pos"].x = new_pos.x
+        blue_bag["pos"].z = new_pos.z
+
+    elif kind == "red_bag":
+        red_bag["pos"].x = new_pos.x
+        red_bag["pos"].z = new_pos.z
+
+    elif kind == "blue_barrier":
+        blue_barrier_pos.x = new_pos.x
+        blue_barrier_pos.z = new_pos.z
+
+    elif kind == "red_barrier":
+        red_barrier_pos.x = new_pos.x
+        red_barrier_pos.z = new_pos.z
+
+
+def cursor_position_callback(window, mouse_x, mouse_y):
+    global dragging
+
+    if dragging is None or vencedor is not None:
+        return
+
+    world_pos = mouse_to_world_on_plane(mouse_x, mouse_y, dragging["plane_y"])
+
+    if world_pos is None:
+        return
+
+    new_pos = world_pos + dragging["offset"]
+    new_pos.y = dragging["original_y"]
+
+    set_object_position(dragging["kind"], dragging["index"], new_pos)
+
+
+def mouse_button_callback(window, button, action, mods):
+    global dragging
+    global selected_action_player
+
+    if button != glfw.MOUSE_BUTTON_LEFT:
+        return
+
+    mouse_x, mouse_y = glfw.get_cursor_pos(window)
+
+    if action == glfw.RELEASE:
+        dragging = None
+        return
+
+    if action != glfw.PRESS:
+        return
+
+    if tela_atual == "selecao":
+        handle_selection_click(mouse_x, mouse_y)
+        return
+
+    if vencedor is not None:
+        return
+
+    if handle_action_click(mouse_x, mouse_y):
+        return
+
+    if mouse_inside_roleta(mouse_x, mouse_y):
+        return
+
+    clicked_player = get_clicked_player(mouse_x, mouse_y)
+    if clicked_player is not None and player_team[clicked_player] == jogador_turno:
+        selected_action_player = clicked_player
+        return
+
+    nearest_object = None
+    nearest_distance = 999999.0
+
+    for obj in get_draggable_objects():
+        world_pos = mouse_to_world_on_plane(mouse_x, mouse_y, obj["plane_y"])
+
+        if world_pos is None:
+            continue
+
+        dx = world_pos.x - obj["pos"].x
+        dz = world_pos.z - obj["pos"].z
+        distance = math.sqrt(dx * dx + dz * dz)
+
+        if distance < obj["radius"] and distance < nearest_distance:
+            nearest_object = obj
+            nearest_distance = distance
+
+    if nearest_object is not None:
+        world_pos = mouse_to_world_on_plane(mouse_x, mouse_y, nearest_object["plane_y"])
+
+        dragging = {
+            "kind": nearest_object["kind"],
+            "index": nearest_object["index"],
+            "plane_y": nearest_object["plane_y"],
+            "original_y": nearest_object["pos"].y,
+            "offset": nearest_object["pos"] - world_pos,
+        }
+
+
+
+
+def run():
+    global window, hand_cursor, shader, button_shader, button_vao, button_vbo, text_renderer, cube_vao, cube_count, sphere_vao, sphere_count, barrier_vao, barrier_count, projection_loc, view_loc, model_loc, object_color_loc, light_color_loc, light_pos_loc, view_pos_loc, camera_distance, camera_angle, camera_target_angle, camera_forward_offset, board_half_width, board_bottom_length, board_top_length, action_buttons, action_hovered, dragging, tela_atual, jogador_selecionando, jogador1_selecao, jogador2_selecao, player_team, current_view, current_projection, current_window_width, current_window_height, blue_barrier_pos, red_barrier_pos, roleta_x, roleta_y, roleta_largura, roleta_altura, roleta_tipos, roleta_opcoes, roleta_resultados, roleta_girando, roleta_fim_tempo, roleta_proximo_tick, jogador_turno, space_pressed_last, selected_action_player, action_key_1_last, action_key_2_last, action_key_3_last, action_key_4_last, vencedor, players, player_colors, player_names, personagem_stats, player_panels, blue_bag, red_bag
+
+    # Inicializacao da janela, contexto OpenGL e buffers usados pelo jogo.
+    if not glfw.init():
+        raise Exception("GLFW nao iniciou")
+
+    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+
+    window = glfw.create_window(
+        WINDOW_WIDTH,
+        WINDOW_HEIGHT,
+        GAME_TITLE,
+        None,
+        None
+    )
+
+    if not window:
+        glfw.terminate()
+        raise Exception("Erro ao criar janela")
+
+    glfw.make_context_current(window)
+    glfw.set_framebuffer_size_callback(window, framebuffer_size_callback)
+    glfw.set_mouse_button_callback(window, mouse_button_callback)
+    glfw.set_cursor_pos_callback(window, cursor_position_callback)
+    hand_cursor = glfw.create_standard_cursor(glfw.HAND_CURSOR)
+
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    shader = create_shader_program(VERTEX_SHADER, FRAGMENT_SHADER)
+    button_shader, button_vao, button_vbo = create_button_renderer()
+    text_renderer = TextRenderer()
+
+    cube_vao, cube_count = create_cube()
+    sphere_vao, sphere_count = create_sphere()
+    barrier_vao, barrier_count = create_curved_barrier()
+
+    camera_distance = CAMERA_DISTANCE
+    camera_angle = CAMERA_ANGLE
+    camera_target_angle = CAMERA_ANGLE
+    camera_forward_offset = CAMERA_FORWARD_OFFSET
+
+    board_half_width = BOARD_HALF_WIDTH
+    board_bottom_length = BOARD_BOTTOM_LENGTH
+    board_top_length = BOARD_TOP_LENGTH
+
+    action_buttons = []
+    action_hovered = False
+    dragging = None
+    tela_atual = "selecao"
+    jogador_selecionando = 1
+    jogador1_selecao = []
+    jogador2_selecao = []
+    player_team = [1, 1, 2, 2]
+
+    current_view = None
+    current_projection = None
+    current_window_width = WINDOW_WIDTH
+    current_window_height = WINDOW_HEIGHT
+
+    blue_barrier_pos = glm.vec3(0.18, 0.05, 8.99)
+    red_barrier_pos = glm.vec3(-0.04, 0.05, -8.59)
+    roleta_x = ROLETA_X
+    roleta_y = ROLETA_Y
+    roleta_largura = ROLETA_LARGURA
+    roleta_altura = ROLETA_ALTURA
+    roleta_tipos = ["ataque", "roubo", "evolucao", "barreira"]
+    roleta_opcoes = {
+        "ataque": {"color": (1.00, 0.25, 0.20)},
+        "roubo": {"color": (0.20, 0.70, 1.00)},
+        "evolucao": {"color": (0.85, 0.30, 0.95)},
+        "barreira": {"color": (0.62, 0.62, 0.66)},
+    }
+    roleta_resultados = ["ataque", "roubo", "evolucao", "barreira", "ataque"]
+    roleta_girando = False
+    roleta_fim_tempo = 0.0
+    roleta_proximo_tick = 0.0
+    jogador_turno = 1
+    space_pressed_last = False
+    selected_action_player = None
+    action_key_1_last = False
+    action_key_2_last = False
+    action_key_3_last = False
+    action_key_4_last = False
+    vencedor = None
+
+    players = [
+        {"name": "TIGRE", "pos": glm.vec3(-4.49, 0.5, 12.56), "color": (0.2, 0.5, 1.0)},
+        {"name": "DRAGAO", "pos": glm.vec3(4.47, 0.5, 12.60), "color": (1.0, 0.25, 0.25)},
+        {"name": "PANDA", "pos": glm.vec3(-4.31, 0.5, -12.76), "color": (0.25, 0.85, 0.45)},
+        {"name": "MACACO", "pos": glm.vec3(4.62, 0.5, -12.88), "color": (0.75, 0.35, 1.0)}
+    ]
+
+    player_colors = [
+        (0.2, 0.5, 1.0),
+        (1.0, 0.25, 0.25),
+        (0.25, 0.85, 0.45),
+        (0.75, 0.35, 1.0),
+    ]
+
+    player_names = [
+        "TIGRE",
+        "DRAGAO",
+        "PANDA",
+        "MACACO",
+    ]
+
+    personagem_stats = [
+        {
+            "ataque_pontos": 3,
+            "ataque_max": 5,
+            "dano": 3,
+            "ataque_requer_muro_destruido": True,
+            "roubo_pontos": 0,
+            "roubo_max": 0,
+            "pode_roubar": False,
+            "roubo_requer_muro_destruido": False,
+            "roubo_moedas": 0,
+            "evolucao_pontos": 0,
+            "evolucao_max": 8,
+            "defesa_pontos": 0,
+            "defesa_max": 5,
+            "evolucao_bonus": "dano",
+            "nivel": 1,
+        },
+        {
+            "ataque_pontos": 1,
+            "ataque_max": 5,
+            "dano": 1,
+            "ataque_requer_muro_destruido": False,
+            "roubo_pontos": 0,
+            "roubo_max": 0,
+            "pode_roubar": False,
+            "roubo_requer_muro_destruido": False,
+            "roubo_moedas": 0,
+            "evolucao_pontos": 0,
+            "evolucao_max": 8,
+            "defesa_pontos": 0,
+            "defesa_max": 5,
+            "evolucao_bonus": "dano",
+            "nivel": 1,
+        },
+        {
+            "ataque_pontos": 3,
+            "ataque_max": 5,
+            "dano": 3,
+            "ataque_requer_muro_destruido": True,
+            "roubo_pontos": 0,
+            "roubo_max": 3,
+            "pode_roubar": True,
+            "roubo_requer_muro_destruido": True,
+            "roubo_moedas": 2,
+            "evolucao_pontos": 0,
+            "evolucao_max": 8,
+            "defesa_pontos": 0,
+            "defesa_max": 5,
+            "evolucao_bonus": "dano",
+            "nivel": 1,
+        },
+        {
+            "ataque_pontos": 1,
+            "ataque_max": 5,
+            "dano": 1,
+            "ataque_requer_muro_destruido": False,
+            "roubo_pontos": 0,
+            "roubo_max": 7,
+            "pode_roubar": True,
+            "roubo_requer_muro_destruido": False,
+            "roubo_moedas": 1,
+            "evolucao_pontos": 0,
+            "evolucao_max": 8,
+            "defesa_pontos": 0,
+            "defesa_max": 5,
+            "evolucao_bonus": "roubo",
+            "nivel": 1,
+        },
+    ]
+
+    player_panels = {
+        1: {
+            "muro": 5,
+            "muro_max": 5,
+            "saco_moedas": 10,
+            "saco_moedas_max": 10,
+            "personagens": [
+                {"name": player_names[0], "color": player_colors[0], "stats": dict(personagem_stats[0]), "team": 1, "player_index": 0},
+                {"name": player_names[1], "color": player_colors[1], "stats": dict(personagem_stats[1]), "team": 1, "player_index": 1},
+            ],
+        },
+        2: {
+            "muro": 5,
+            "muro_max": 5,
+            "saco_moedas": 10,
+            "saco_moedas_max": 10,
+            "personagens": [
+                {"name": player_names[2], "color": player_colors[2], "stats": dict(personagem_stats[2]), "team": 2, "player_index": 2},
+                {"name": player_names[3], "color": player_colors[3], "stats": dict(personagem_stats[3]), "team": 2, "player_index": 3},
+            ],
+        },
+    }
+
+    blue_bag = {"pos": glm.vec3(0.15, 0.4, 9.44), "carrier": None}
+    red_bag = {"pos": glm.vec3(-0.03, 0.4, -9.22), "carrier": None}
+
+    while not glfw.window_should_close(window):
+        current_frame = glfw.get_time()
+
+        glfw.poll_events()
+
+        if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
+            glfw.set_window_should_close(window, True)
+
+        if tela_atual == "selecao":
+            width, height = glfw.get_framebuffer_size(window)
+            current_window_width = width
+            current_window_height = height
+
+            glClearColor(0.08, 0.09, 0.11, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+            glDisable(GL_DEPTH_TEST)
+            glUseProgram(button_shader)
+            draw_selection_screen(width, height)
+            glEnable(GL_DEPTH_TEST)
+
+            glfw.swap_buffers(window)
+            continue
+
+        space_pressed = glfw.get_key(window, glfw.KEY_SPACE) == glfw.PRESS
+        if space_pressed and not space_pressed_last and not roleta_girando and vencedor is None:
+            iniciar_roleta(current_frame)
+        space_pressed_last = space_pressed
+
+        atualizar_roleta(current_frame)
+
+        if not roleta_girando and vencedor is None:
+            verificar_teclas_de_acao()
+
+        for i, player in enumerate(players):
+            pos = player["pos"]
+
+            if player_team[i] == 1 and red_bag["carrier"] is None:
+                if glm.distance(pos, red_bag["pos"]) < 1.2:
+                    red_bag["carrier"] = i
+
+            if player_team[i] == 2 and blue_bag["carrier"] is None:
+                if glm.distance(pos, blue_bag["pos"]) < 1.2:
+                    blue_bag["carrier"] = i
+
+        if blue_bag["carrier"] is not None:
+            blue_bag["pos"] = players[blue_bag["carrier"]]["pos"] + glm.vec3(0, 0.7, 0)
+
+        if red_bag["carrier"] is not None:
+            red_bag["pos"] = players[red_bag["carrier"]]["pos"] + glm.vec3(0, 0.7, 0)
+
+        if red_bag["carrier"] is not None and player_team[red_bag["carrier"]] == 1:
+            carrier_pos = players[red_bag["carrier"]]["pos"]
+
+            if glm.distance(carrier_pos, glm.vec3(0, 0.05, 5.5)) < 1.5:
+                red_bag["carrier"] = None
+                red_bag["pos"] = glm.vec3(0, 0.4, -5.5)
+
+        if blue_bag["carrier"] is not None and player_team[blue_bag["carrier"]] == 2:
+            carrier_pos = players[blue_bag["carrier"]]["pos"]
+
+            if glm.distance(carrier_pos, glm.vec3(0, 0.05, -5.5)) < 1.5:
+                blue_bag["carrier"] = None
+                blue_bag["pos"] = glm.vec3(0, 0.4, 5.5)
+
+        glClearColor(0.82, 0.86, 0.91, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        glUseProgram(self.id_shader)
 
-        glUniformMatrix4fv(self.locais["projection"], 1, GL_FALSE, glm.value_ptr(projecao))
-        glUniformMatrix4fv(self.locais["view"], 1, GL_FALSE, glm.value_ptr(visao))
-        glUniform3f(self.locais["lightColor"], 1, 1, 1)
-        glUniform3f(self.locais["lightPos"], 0, 14, 0)
-        glUniform3fv(self.locais["viewPos"], 1, glm.value_ptr(posicao_camera))
+        glUseProgram(shader)
 
-    def _renderizar_selecao_campeoes(self, janela, proporcao: float):
-        """Renderiza a tela 3D de seleção de campeões."""
-        posicao_camera = glm.vec3(0, 8.5, 18)
-        visao = glm.lookAt(posicao_camera, glm.vec3(0, 0.5, 0), glm.vec3(0, 1, 0))
-        projecao = glm.perspective(glm.radians(35), proporcao, 0.1, 100.0)
-        self._iniciar_cena(visao, projecao, posicao_camera)
+        width, height = glfw.get_framebuffer_size(window)
+        aspect = width / height
 
-        self.desenhar_cubo(glm.vec3(0, -0.15, 0), glm.vec3(10, 0.1, 6), (0.88, 0.88, 0.90))
+        camera_angle = camera_target_angle
 
-        cor_pedestal = (0.55, 0.55, 0.55)
-        cor_destaque = (1.0, 0.9, 0.15)
-        cor_escolhido = (0.9, 0.9, 0.95)
-        cor_escolhido_outro = (0.82, 0.82, 0.86)
+        forward_x = -math.sin(camera_angle)
+        forward_z = -math.cos(camera_angle)
 
-        posicoes_x = [-6.0, -2.0, 2.0, 6.0]
-        for i, option in enumerate(self.opcoes_campeoes[:4]):
-            x = posicoes_x[i]
-            is_chosen = i in self._indices_campeoes_escolhidos[self._time_selecionando]
-            is_other_chosen = i in self._indices_campeoes_escolhidos[1 - self._time_selecionando]
-            is_selected = i == self.indice_campeao_selecionado
-            pedestal = cor_pedestal
-            escala_esfera = 0.6
-            if is_chosen:
-                pedestal = cor_escolhido
-                escala_esfera = 0.68
-            elif is_other_chosen:
-                pedestal = cor_escolhido_outro
-                escala_esfera = 0.64
-            if is_selected:
-                pedestal = cor_destaque
-                escala_esfera = 0.75
-            self.desenhar_cubo(glm.vec3(x, 0.25, 0), glm.vec3(1.2, 0.25, 1.2), pedestal)
-            self.desenhar_esfera(glm.vec3(x, 0.85, 0), escala_esfera, option["cor"])
+        camera_focus = glm.vec3(
+            forward_x * camera_forward_offset,
+            0,
+            forward_z * camera_forward_offset
+        )
 
-        y_previa = 0.25
-        z_previa = -2.6
-        cor_pedestal_previa = (0.6, 0.6, 0.62)
-        cor_vazia = (0.75, 0.75, 0.78)
-        posicoes_previas = [
-            (-3.0, 0, 0),
-            (-1.0, 0, 1),
-            (1.0, 1, 0),
-            (3.0, 1, 1),
-        ]
-        for x, time, posicao in posicoes_previas:
-            esta_no_slot_atual = time == self._time_selecionando and posicao == self._slot_selecionando
-            pedestal = cor_destaque if esta_no_slot_atual else cor_pedestal_previa
-            idx = self._indices_campeoes_escolhidos[time][posicao]
-            cor = self.opcoes_campeoes[idx]["cor"] if idx is not None else cor_vazia
-            self.desenhar_cubo(glm.vec3(x, y_previa, z_previa), glm.vec3(0.9, 0.22, 0.9), pedestal)
-            self.desenhar_esfera(glm.vec3(x, y_previa + 0.55, z_previa), 0.5, cor)
-
-        glUseProgram(0)
-
-    def renderizar(self, janela):
-        """Renderiza a cena atual (seleção ou partida)."""
-        largura, altura = glfw.get_framebuffer_size(janela)
-        if altura == 0:
-            return
-
-        proporcao = largura / altura
-
-        if self.modo == "selecao":
-            self._renderizar_selecao_campeoes(janela, proporcao)
-            self._renderizar_placar_superior(proporcao)
-            return
-        if self._partida_finalizada:
-            self._renderizar_tela_vitoria(proporcao)
-            return
-
-        frente_x = -math.sin(self.angulo_camera)
-        frente_z = -math.cos(self.angulo_camera)
-        foco_camera = glm.vec3(frente_x * self.deslocamento_frente_camera, 0, frente_z * self.deslocamento_frente_camera)
-        posicao_camera = foco_camera + glm.vec3(
-            math.sin(self.angulo_camera) * self.distancia_camera,
+        camera_pos = camera_focus + glm.vec3(
+            math.sin(camera_angle) * camera_distance,
             25,
-            math.cos(self.angulo_camera) * self.distancia_camera,
+            math.cos(camera_angle) * camera_distance
         )
 
-        visao = glm.lookAt(posicao_camera, foco_camera, glm.vec3(0, 1, 0))
-        projecao = glm.perspective(glm.radians(25), proporcao, 0.1, 100.0)
-
-        self._iniciar_cena(visao, projecao, posicao_camera)
-
-        centro_tabuleiro_z = (self.tabuleiro_comprimento_baixo - self.tabuleiro_comprimento_cima) / 2.0
-        metade_total_tabuleiro = (self.tabuleiro_comprimento_baixo + self.tabuleiro_comprimento_cima) / 2.0
-
-        self.desenhar_cubo(
-            glm.vec3(0, -0.15, centro_tabuleiro_z),
-            glm.vec3(self.tabuleiro_meia_largura, 0.1, metade_total_tabuleiro),
-            (0.88, 0.88, 0.90),
+        view = glm.lookAt(
+            camera_pos,
+            camera_focus,
+            glm.vec3(0, 1, 0)
         )
 
-        cor_borda = (0.55, 0.55, 0.55)
-        self.desenhar_cubo(
-            glm.vec3(0, 0.35, -self.tabuleiro_comprimento_cima),
-            glm.vec3(self.tabuleiro_meia_largura + 0.2, 0.4, 0.2),
-            cor_borda,
-        )
-        self.desenhar_cubo(
-            glm.vec3(0, 0.35, self.tabuleiro_comprimento_baixo),
-            glm.vec3(self.tabuleiro_meia_largura + 0.2, 0.4, 0.2),
-            cor_borda,
-        )
-        self.desenhar_cubo(glm.vec3(-self.tabuleiro_meia_largura, 0.35, centro_tabuleiro_z), glm.vec3(0.2, 0.4, metade_total_tabuleiro), cor_borda)
-        self.desenhar_cubo(glm.vec3(self.tabuleiro_meia_largura, 0.35, centro_tabuleiro_z), glm.vec3(0.2, 0.4, metade_total_tabuleiro), cor_borda)
-
-        boost_azul = min(self.vida_muro_time[1], 40) * 0.008
-        boost_vermelho = min(self.vida_muro_time[0], 40) * 0.008
-        self.desenhar_barreira(self.pos_barreira_azul, (0.45 + boost_azul, 0.45 + boost_azul, 0.45 + boost_azul), 180)
-        self.desenhar_barreira(self.pos_barreira_vermelha, (0.45 + boost_vermelho, 0.45 + boost_vermelho, 0.45 + boost_vermelho), 0)
-
-        self.desenhar_cubo(self.pos_gol_azul, glm.vec3(0.9, 0.05, 0.9), (0.2, 0.75, 1.0), 45)
-        self.desenhar_cubo(self.pos_gol_vermelho, glm.vec3(0.9, 0.05, 0.9), (1.0, 0.25, 0.25), 45)
-
-        for jogador in self.jogadores:
-            self.desenhar_esfera(jogador["posicao"], 0.6, jogador["cor"])
-
-        base_altura = 0.22
-        altura_azul = base_altura + min(self.moedas_time[1], 60) * 0.02
-        altura_vermelho = base_altura + min(self.moedas_time[0], 60) * 0.02
-        self.desenhar_cubo(
-            self.pos_saco_azul + glm.vec3(0, altura_azul / 2.0 - 0.15, 0),
-            glm.vec3(0.45, altura_azul, 0.45),
-            (1.0, 0.9, 0.15),
-        )
-        self.desenhar_cubo(
-            self.pos_saco_vermelho + glm.vec3(0, altura_vermelho / 2.0 - 0.15, 0),
-            glm.vec3(0.45, altura_vermelho, 0.45),
-            (1.0, 0.65, 0.05),
+        projection = glm.perspective(
+            glm.radians(25),
+            aspect,
+            0.1,
+            100.0
         )
 
-        self._desenhar_colunas_recursos()
-        self._desenhar_forca_muro()
-        self._desenhar_tablet_e_roleta()
+        current_view = view
+        current_projection = projection
+        current_window_width = width
+        current_window_height = height
 
-        self._renderizar_placar_superior(proporcao)
-        glUseProgram(0)
+        projection_loc = glGetUniformLocation(shader, "projection")
+        view_loc = glGetUniformLocation(shader, "view")
+        model_loc = glGetUniformLocation(shader, "model")
+        object_color_loc = glGetUniformLocation(shader, "objectColor")
+        light_color_loc = glGetUniformLocation(shader, "lightColor")
+        light_pos_loc = glGetUniformLocation(shader, "lightPos")
+        view_pos_loc = glGetUniformLocation(shader, "viewPos")
+
+        glUniformMatrix4fv(projection_loc, 1, GL_FALSE, glm.value_ptr(projection))
+        glUniformMatrix4fv(view_loc, 1, GL_FALSE, glm.value_ptr(view))
+
+        glUniform3f(light_color_loc, 1, 1, 1)
+        glUniform3f(light_pos_loc, 0, 14, 0)
+        glUniform3fv(view_pos_loc, 1, glm.value_ptr(camera_pos))
+
+        board_center_z = (board_bottom_length - board_top_length) / 2.0
+        board_total_half = (board_bottom_length + board_top_length) / 2.0
+
+        draw_cube(
+            glm.vec3(0, -0.15, board_center_z),
+            glm.vec3(board_half_width, 0.1, board_total_half),
+            (0.88, 0.88, 0.90)
+        )
+
+        border_color = (0.55, 0.55, 0.55)
+
+        draw_cube(glm.vec3(0, 0.35, -board_top_length), glm.vec3(board_half_width + 0.2, 0.4, 0.2), border_color)
+        draw_cube(glm.vec3(0, 0.35, board_bottom_length), glm.vec3(board_half_width + 0.2, 0.4, 0.2), border_color)
+        draw_cube(glm.vec3(-board_half_width, 0.35, board_center_z), glm.vec3(0.2, 0.4, board_total_half), border_color)
+        draw_cube(glm.vec3(board_half_width, 0.35, board_center_z), glm.vec3(0.2, 0.4, board_total_half), border_color)
+
+        if player_panels[1]["muro"] > 0:
+            draw_barrier(red_barrier_pos, (0.55, 0.55, 0.55), 0)
+        if player_panels[2]["muro"] > 0:
+            draw_barrier(blue_barrier_pos, (0.55, 0.55, 0.55), 180)
+
+        for index, player in enumerate(players):
+            if selected_action_player == index:
+                draw_sphere(player["pos"], 0.72, player["color"])
+            else:
+                draw_sphere(player["pos"], 0.6, player["color"])
+
+        draw_cube(blue_bag["pos"], glm.vec3(0.45, 0.45, 0.45), (1.0, 0.9, 0.15))
+        draw_cube(red_bag["pos"], glm.vec3(0.45, 0.45, 0.45), (1.0, 0.65, 0.05))
+
+        glDisable(GL_DEPTH_TEST)
+        glUseProgram(button_shader)
+
+        action_hovered = False
+        action_buttons.clear()
+        draw_roleta_tela(width, height)
+        draw_status_panels(width, height)
+        draw_game_over(width, height)
+        glfw.set_cursor(window, hand_cursor if action_hovered else None)
+
+        glEnable(GL_DEPTH_TEST)
+
+        glfw.swap_buffers(window)
+
+    glfw.terminate()
+
+
+
+if __name__ == "__main__":
+    run()

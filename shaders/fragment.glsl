@@ -1,16 +1,13 @@
 #version 330 core
-
 in vec3 FragPos;
 in vec3 Normal;
-
 out vec4 FragColor;
-
 uniform vec3 objectColor;
 uniform vec3 lightColor;
 uniform vec3 lightPos;
 uniform vec3 viewPos;
-
-void main(){
+void main()
+{
     float ambientStrength = 0.35;
     vec3 ambient = ambientStrength * lightColor;
     vec3 norm = normalize(Normal);
