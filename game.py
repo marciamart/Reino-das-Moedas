@@ -10,10 +10,42 @@ from PIL import Image, ImageDraw, ImageFont
 from OpenGL.GL import *
 
 from config import *
-from obj.geometry import create_cube, create_sphere, create_curved_barrier
+from obj.geometry import create_cube, create_mesh_from_npz, create_textured_quad
 
 
 SHADER_DIR = Path(__file__).with_name("shaders")
+ASSET_DIR = Path(__file__).with_name("assets")
+MODEL_DIR = Path(__file__).with_name("obj") / "models"
+CHARACTER_IMAGE_FILES = [
+    "tigre.png",
+    "dragao.png",
+    "panda.png",
+    "macaco.png",
+]
+CHARACTER_MODEL_FILES = [
+    "tigre.npz",
+    "dragao.npz",
+    "panda.npz",
+    "macaco.npz",
+]
+
+
+class Player:
+    """Representa um personagem no tabuleiro: nome, posicao 3D, time,
+    qual personagem foi escolhido e seus atributos (stats) de jogo."""
+
+    def __init__(self, name, pos, team, personagem=None, stats=None):
+        self.name = name
+        self.pos = pos
+        self.team = team
+        self.personagem = personagem
+        self.stats = stats
+
+    def is_aliado(self, other):
+        return self.team == other.team
+
+    def __repr__(self):
+        return f"Player(name={self.name!r}, team={self.team}, personagem={self.personagem})"
 
 
 def load_shader_source(filename):
@@ -26,10 +58,6 @@ BUTTON_VERTEX_SHADER = load_shader_source("button_vertex.glsl")
 BUTTON_FRAGMENT_SHADER = load_shader_source("button_fragment.glsl")
 TEXT_VERTEX_SHADER = load_shader_source("text_vertex.glsl")
 TEXT_FRAGMENT_SHADER = load_shader_source("text_fragment.glsl")
-
-
-
-
 
 
 def compile_shader(source, shader_type):
@@ -172,6 +200,93 @@ class TextRenderer:
         glDrawArrays(GL_TRIANGLES, 0, 6)
 
 
+def load_texture(path):
+    image = Image.open(path).convert("RGBA").transpose(Image.FLIP_TOP_BOTTOM)
+    width, height = image.size
+
+    texture = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, texture)
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image.tobytes())
+    return texture
+
+
+def load_floor_texture(path):
+    image = Image.open(path).convert("RGB").transpose(Image.FLIP_TOP_BOTTOM)
+    width, height = image.size
+
+    texture = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, texture)
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, image.tobytes())
+    glGenerateMipmap(GL_TEXTURE_2D)
+
+    # Filtro anisotropico: sem ele, o piso visto em angulo raso (como no
+    # tabuleiro, visto de cima meio inclinado) gera linhas de serrilhado/moire.
+    # Isso evita o problema sem precisar borrar a textura toda.
+    try:
+        GL_TEXTURE_MAX_ANISOTROPY_EXT = 0x84FE
+        GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT = 0x84FF
+        max_aniso = glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT)
+        if max_aniso and max_aniso > 0:
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, max_aniso)
+    except Exception:
+        pass
+
+    return texture
+
+
+def load_character_textures():
+    textures = []
+    character_dir = ASSET_DIR / "personagens"
+    for filename in CHARACTER_IMAGE_FILES:
+        textures.append(load_texture(character_dir / filename))
+    return textures
+
+
+def load_character_models():
+    models = []
+    for filename in CHARACTER_MODEL_FILES:
+        models.append(create_mesh_from_npz(MODEL_DIR / filename))
+    return models
+
+
+def draw_texture(texture, x, y, w, h, window_width, window_height):
+    left, top = to_ndc(x, y, window_width, window_height)
+    right, bottom = to_ndc(x + w, y + h, window_width, window_height)
+    vertices = np.array([
+        left, bottom, 0.0, 0.0,
+        right, bottom, 1.0, 0.0,
+        right, top, 1.0, 1.0,
+        left, bottom, 0.0, 0.0,
+        right, top, 1.0, 1.0,
+        left, top, 0.0, 1.0,
+    ], dtype=np.float32)
+
+    glUseProgram(text_renderer.program)
+    glActiveTexture(GL_TEXTURE0)
+    glBindTexture(GL_TEXTURE_2D, texture)
+    glUniform1i(glGetUniformLocation(text_renderer.program, "textTexture"), 0)
+    glBindBuffer(GL_ARRAY_BUFFER, text_renderer.vbo)
+    glBufferSubData(GL_ARRAY_BUFFER, 0, vertices.nbytes, vertices)
+    glBindVertexArray(text_renderer.vao)
+    glDrawArrays(GL_TRIANGLES, 0, 6)
+
+
+def draw_character_portrait(character_index, x, y, w, h, window_width, window_height):
+    if character_index is None or character_index < 0 or character_index >= len(character_textures):
+        return
+    draw_texture(character_textures[character_index], x, y, w, h, window_width, window_height)
+
+
 def draw_cube(position, scale, color, rotation_y=0):
     model = glm.mat4(1.0)
     model = glm.translate(model, position)
@@ -179,34 +294,121 @@ def draw_cube(position, scale, color, rotation_y=0):
     model = glm.scale(model, scale)
 
     glUniformMatrix4fv(model_loc, 1, GL_FALSE, glm.value_ptr(model))
+    glUniform1i(use_vertex_color_loc, 0)
+    glUniform1i(use_texture_loc, 0)
     glUniform3f(object_color_loc, *color)
 
     glBindVertexArray(cube_vao)
     glDrawElements(GL_TRIANGLES, cube_count, GL_UNSIGNED_INT, None)
 
 
-def draw_sphere(position, scale, color):
+def draw_floor(position, width, depth):
     model = glm.mat4(1.0)
     model = glm.translate(model, position)
+    model = glm.scale(model, glm.vec3(width, 1.0, depth))
+
+    glUniformMatrix4fv(model_loc, 1, GL_FALSE, glm.value_ptr(model))
+    glUniform1i(use_vertex_color_loc, 0)
+    glUniform1i(use_texture_loc, 1)
+
+    glActiveTexture(GL_TEXTURE0)
+    glBindTexture(GL_TEXTURE_2D, floor_texture)
+
+    glBindVertexArray(floor_vao)
+    glDrawElements(GL_TRIANGLES, floor_count, GL_UNSIGNED_INT, None)
+
+
+def get_oponente_pos(player_index):
+    # Cada personagem enfrenta quem esta posicionado no espelho dele do
+    # outro lado do tabuleiro (mesmo x, z oposto).
+    own = players[player_index].pos
+    nearest_index = None
+    nearest_dx = None
+    for index, other in enumerate(players):
+        if index == player_index or players[index].team == players[player_index].team:
+            continue
+        dx = abs(other.pos.x - own.x)
+        if nearest_dx is None or dx < nearest_dx:
+            nearest_dx = dx
+            nearest_index = index
+    if nearest_index is None:
+        return glm.vec3(own.x, own.y, -own.z)
+    return players[nearest_index].pos
+
+
+def draw_character_model(player_index, scale, current_frame):
+    personagem_idx = players[player_index].personagem
+    vao, count = character_models[personagem_idx]
+    pos = players[player_index].pos
+    alvo = get_oponente_pos(player_index)
+
+    dx = alvo.x - pos.x
+    dz = alvo.z - pos.z
+    rotation_y = math.degrees(math.atan2(dx, dz)) if (dx or dz) else 0.0
+
+    # pos.y e o "ancora" dos pes do personagem (ja embutido no modelo);
+    # escalamos esse ancora junto para o personagem nao flutuar nem
+    # afundar no tabuleiro quando aumentado (ex: destaque de selecao).
+    model = glm.mat4(1.0)
+    model = glm.translate(model, glm.vec3(pos.x, pos.y * scale, pos.z))
+    model = glm.rotate(model, glm.radians(rotation_y), glm.vec3(0, 1, 0))
     model = glm.scale(model, glm.vec3(scale))
 
     glUniformMatrix4fv(model_loc, 1, GL_FALSE, glm.value_ptr(model))
-    glUniform3f(object_color_loc, *color)
+    glUniform1i(use_vertex_color_loc, 1)
+    glUniform1i(use_texture_loc, 0)
 
-    glBindVertexArray(sphere_vao)
-    glDrawElements(GL_TRIANGLES, sphere_count, GL_UNSIGNED_INT, None)
+    glBindVertexArray(vao)
+    glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, None)
 
 
-def draw_barrier(position, color, rotation_y=0):
+def get_shake_offset(tipo, team, current_frame):
+    # Tremida que decai com o tempo, aplicada apenas no objeto realmente
+    # atingido (a barreira ou o saco de moedas do time que recebeu o golpe).
+    if hit_reaction is None or hit_reaction["tipo"] != tipo or hit_reaction["team"] != team:
+        return glm.vec3(0, 0, 0)
+
+    elapsed = current_frame - hit_reaction["start_time"]
+    if elapsed < 0 or elapsed >= HIT_SHAKE_DURATION:
+        return glm.vec3(0, 0, 0)
+
+    decay = 1.0 - (elapsed / HIT_SHAKE_DURATION)
+    wave = math.sin(elapsed * HIT_SHAKE_FREQUENCY) * HIT_SHAKE_MAGNITUDE * decay
+    return glm.vec3(wave, 0, wave * 0.6)
+
+
+def draw_barrier(position, rotation_y, team, current_frame):
+    position = position + get_shake_offset("muro", team, current_frame)
+
     model = glm.mat4(1.0)
     model = glm.translate(model, position)
     model = glm.rotate(model, glm.radians(rotation_y), glm.vec3(0, 1, 0))
 
     glUniformMatrix4fv(model_loc, 1, GL_FALSE, glm.value_ptr(model))
-    glUniform3f(object_color_loc, *color)
+    glUniform1i(use_vertex_color_loc, 0)
+    glUniform1i(use_texture_loc, 1)
+
+    glActiveTexture(GL_TEXTURE0)
+    glBindTexture(GL_TEXTURE_2D, barreira_texture)
 
     glBindVertexArray(barrier_vao)
     glDrawElements(GL_TRIANGLES, barrier_count, GL_UNSIGNED_INT, None)
+
+
+def draw_bag_model(position, color, team, current_frame, scale=1.0):
+    position = position + get_shake_offset("saco", team, current_frame)
+
+    model = glm.mat4(1.0)
+    model = glm.translate(model, position)
+    model = glm.scale(model, glm.vec3(scale))
+
+    glUniformMatrix4fv(model_loc, 1, GL_FALSE, glm.value_ptr(model))
+    glUniform1i(use_vertex_color_loc, 0)
+    glUniform1i(use_texture_loc, 0)
+    glUniform3f(object_color_loc, *color)
+
+    glBindVertexArray(moedas_vao)
+    glDrawElements(GL_TRIANGLES, moedas_count, GL_UNSIGNED_INT, None)
 
 
 def get_roleta_x(window_width):
@@ -233,12 +435,6 @@ def draw_roleta_tela(window_width, window_height):
         barra_x = tela_x + gap + i * (barra_largura + gap)
         barra_y = tela_y + gap
         draw_button(barra_x, barra_y, barra_largura, barra_altura, roleta_opcoes[resultado]["color"], window_width, window_height)
-
-
-def draw_stat_bar(x, y, w, h, value, max_value, color, window_width, window_height):
-    draw_button(x, y, w, h, (0.16, 0.17, 0.20), window_width, window_height)
-    fill_w = w * max(0, min(max_value, value)) / max_value
-    draw_button(x, y, fill_w, h, color, window_width, window_height)
 
 
 def draw_segmented_stat_bar(x, y, w, h, value, max_value, color, window_width, window_height, active=True):
@@ -292,9 +488,17 @@ def draw_action_label(label, acao, player_index, x, y, scale, active, window_wid
     })
 
 
+def get_personagem_image_index(personagem):
+    player_index = personagem["player_index"]
+    if 0 <= player_index < len(players) and players[player_index].personagem is not None:
+        return players[player_index].personagem
+    if personagem["name"] in player_names:
+        return player_names.index(personagem["name"])
+    return None
+
+
 def draw_personagem_info(x, y, w, personagem, window_width, window_height):
     stats = personagem["stats"]
-    cor = personagem["color"]
     player_index = personagem["player_index"]
     roubo_disponivel = pode_roubar_contra_alvo(stats, personagem["team"])
     defesa_disponivel = stats["defesa_pontos"] >= stats["defesa_max"] and pode_defender(personagem["team"])
@@ -303,16 +507,18 @@ def draw_personagem_info(x, y, w, personagem, window_width, window_height):
     draw_button(x, y, w, card_h, (0.09, 0.10, 0.13), window_width, window_height)
 
     nome_scale = 2
-    nome_x = x + 10 + 17 - get_text_width(personagem["name"], nome_scale) / 2
+    portrait_size = 40
+    nome_x = x + 8 + portrait_size / 2 - get_text_width(personagem["name"], nome_scale) / 2
     draw_text(personagem["name"], nome_x, y + 8, nome_scale, (0.88, 0.90, 0.95), window_width, window_height)
-    draw_button(x + 10, y + 30, 34, 34, cor, window_width, window_height)
+    draw_button(x + 8, y + 28, portrait_size, portrait_size, (0.03, 0.03, 0.04), window_width, window_height)
+    draw_character_portrait(get_personagem_image_index(personagem), x + 10, y + 30, portrait_size - 4, portrait_size - 4, window_width, window_height)
     draw_text(f"DANO {stats['dano']}", x + 5, y + 70, 1, (0.80, 0.82, 0.86), window_width, window_height)
     if stats["pode_roubar"]:
         draw_text(f"ROUBO {stats['roubo_moedas']}", x + 5, y + 80, 1, (0.80, 0.82, 0.86), window_width, window_height)
 
     label_scale = 2
-    bar_x = x + 56
-    bar_w = w - 70
+    bar_x = x + 66
+    bar_w = w - 80
     bars_y = y + 30
 
     draw_action_label("1 ATACAR", "ataque", player_index, bar_x, bars_y, label_scale, pode_atacar(stats), window_width, window_height)
@@ -415,7 +621,7 @@ def pode_evoluir(stats):
 
 
 def adicionar_pontos_personagem(player_index, tipo, pontos):
-    stats = players[player_index]["stats"]
+    stats = players[player_index].stats
 
     if tipo == "ataque":
         stats["ataque_pontos"] = min(stats["ataque_max"], stats["ataque_pontos"] + pontos)
@@ -430,7 +636,7 @@ def adicionar_pontos_personagem(player_index, tipo, pontos):
 
 
 def evoluir_personagem(player_index):
-    stats = players[player_index]["stats"]
+    stats = players[player_index].stats
 
     if not pode_evoluir(stats):
         return False
@@ -444,13 +650,12 @@ def evoluir_personagem(player_index):
 
 
 def atualizar_painel_do_player(player_index):
-    team = player_team[player_index]
+    team = players[player_index].team
     slot = 0 if player_index in [0, 2] else 1
 
     player_panels[team]["personagens"][slot] = {
-        "name": players[player_index]["name"],
-        "color": players[player_index]["color"],
-        "stats": players[player_index]["stats"],
+        "name": players[player_index].name,
+        "stats": players[player_index].stats,
         "team": team,
         "player_index": player_index,
     }
@@ -483,21 +688,13 @@ def roubar_moedas(player_number, quantidade):
     return player_panels[alvo]["saco_moedas"] == 0
 
 
-def verificar_vencedor_por_moedas():
-    if player_panels[1]["saco_moedas"] <= 0:
-        return 2
-    if player_panels[2]["saco_moedas"] <= 0:
-        return 1
-    return None
-
-
 def pode_defender(player_number):
     return player_panels[player_number]["muro"] < player_panels[player_number]["muro_max"]
 
 
 def evoluir_barreira(player_index):
-    stats = players[player_index]["stats"]
-    team = player_team[player_index]
+    stats = players[player_index].stats
+    team = players[player_index].team
 
     if stats["defesa_pontos"] < stats["defesa_max"] or not pode_defender(team):
         return False
@@ -509,6 +706,21 @@ def evoluir_barreira(player_index):
     return True
 
 
+def iniciar_reacao_de_impacto(team_atacante, tipo):
+    # O objeto realmente atingido (a barreira ou o saco de moedas do time
+    # que recebeu o golpe) treme por um instante; a troca de turno (e o
+    # movimento da camera) so acontece depois dessa pausa, para dar tempo
+    # do jogador perceber visualmente o golpe.
+    global hit_reaction
+    global pending_turn_change_time
+
+    tempo_atual = glfw.get_time()
+    time_alvo = player_adversario(team_atacante)
+
+    hit_reaction = {"tipo": tipo, "team": time_alvo, "start_time": tempo_atual}
+    pending_turn_change_time = tempo_atual + HIT_SHAKE_DURATION + HIT_PAUSE_AFTER_SHAKE
+
+
 def executar_acao_personagem(player_index, acao):
     # Aplica a regra da acao escolhida e informa se o turno foi consumido.
     global vencedor
@@ -516,11 +728,11 @@ def executar_acao_personagem(player_index, acao):
     if player_index is None:
         return False
 
-    if player_team[player_index] != jogador_turno:
+    if players[player_index].team != jogador_turno:
         return False
 
-    stats = players[player_index]["stats"]
-    team = player_team[player_index]
+    stats = players[player_index].stats
+    team = players[player_index].team
 
     if acao == "ataque":
         if not pode_atacar(stats):
@@ -531,12 +743,15 @@ def executar_acao_personagem(player_index, acao):
         if stats["ataque_requer_muro_destruido"] and player_panels[alvo]["muro"] > 0:
             atacar_muro(team, stats["dano"])
             atualizar_painel_do_player(player_index)
+            iniciar_reacao_de_impacto(team, "muro")
             return True
 
         venceu = atacar_saco_moedas(team, stats["dano"])
         atualizar_painel_do_player(player_index)
         if venceu:
             vencedor = team
+        else:
+            iniciar_reacao_de_impacto(team, "saco")
         return True
 
     if acao == "roubo":
@@ -548,6 +763,8 @@ def executar_acao_personagem(player_index, acao):
         atualizar_painel_do_player(player_index)
         if venceu:
             vencedor = team
+        else:
+            iniciar_reacao_de_impacto(team, "saco")
         return True
 
     if acao == "evolucao":
@@ -578,7 +795,7 @@ def handle_action_click(mouse_x, mouse_y):
         if action_button["player_index"] != selected_action_player or not action_button["active"]:
             return True
         if executar_acao_personagem(selected_action_player, action_button["acao"]):
-            if vencedor is None:
+            if vencedor is None and pending_turn_change_time is None:
                 finalizar_turno_apos_acao()
             return True
         return True
@@ -602,22 +819,22 @@ def verificar_teclas_de_acao():
         fez_acao = executar_acao_personagem(selected_action_player, "ataque")
 
     if not fez_acao and key_2 and not action_key_2_last:
-        if selected_action_player is not None and players[selected_action_player]["stats"]["pode_roubar"]:
+        if selected_action_player is not None and players[selected_action_player].stats["pode_roubar"]:
             fez_acao = executar_acao_personagem(selected_action_player, "roubo")
         else:
             fez_acao = executar_acao_personagem(selected_action_player, "evolucao")
 
     if not fez_acao and key_3 and not action_key_3_last:
-        if selected_action_player is not None and players[selected_action_player]["stats"]["pode_roubar"]:
+        if selected_action_player is not None and players[selected_action_player].stats["pode_roubar"]:
             fez_acao = executar_acao_personagem(selected_action_player, "evolucao")
         else:
             fez_acao = executar_acao_personagem(selected_action_player, "defesa")
 
     if not fez_acao and key_4 and not action_key_4_last:
-        if selected_action_player is not None and players[selected_action_player]["stats"]["pode_roubar"]:
+        if selected_action_player is not None and players[selected_action_player].stats["pode_roubar"]:
             fez_acao = executar_acao_personagem(selected_action_player, "defesa")
 
-    if fez_acao and vencedor is None:
+    if fez_acao and vencedor is None and pending_turn_change_time is None:
         finalizar_turno_apos_acao()
 
     action_key_1_last = key_1
@@ -666,7 +883,7 @@ def atualizar_roleta(tempo_atual):
 
 
 def aplicar_resultado_roleta(player_number):
-    player_indices = [i for i, team in enumerate(player_team) if team == player_number]
+    player_indices = [i for i, p in enumerate(players) if p.team == player_number]
 
     for resultado in roleta_resultados:
         if resultado == "ataque":
@@ -688,13 +905,11 @@ def aplicar_resultado_roleta(player_number):
 
 def atualizar_camera_por_turno():
     global camera_target_angle
-    global camera_angle
 
     if jogador_turno == 1:
         camera_target_angle = CAMERA_ANGLE
     else:
         camera_target_angle = 0.0
-    camera_angle = camera_target_angle
 
 
 def get_selection_options(window_width, window_height):
@@ -705,26 +920,19 @@ def get_selection_options(window_width, window_height):
     y = window_height / 2 - option_size / 2
 
     options = []
-    for i, color in enumerate(player_colors):
+    for i in range(len(player_names)):
         options.append({
             "index": i,
             "x": start_x + i * (option_size + gap),
             "y": y,
             "w": option_size,
             "h": option_size,
-            "color": color,
         })
 
     return options
 
 
-def is_player_selected(index):
-    return False
-
-
 def aplicar_selecao_players():
-    global player_panels
-
     player_slots = [
         {"pos": glm.vec3(4.62, 0.5, -12.88), "team": 1},
         {"pos": glm.vec3(-4.31, 0.5, -12.76), "team": 1},
@@ -735,20 +943,19 @@ def aplicar_selecao_players():
     ordem_escolhida = jogador1_selecao + jogador2_selecao
 
     for slot, escolha in enumerate(ordem_escolhida):
-        players[slot]["pos"] = glm.vec3(player_slots[slot]["pos"])
-        players[slot]["color"] = player_colors[escolha]
-        players[slot]["name"] = player_names[escolha]
-        players[slot]["personagem"] = escolha
-        players[slot]["stats"] = dict(personagem_stats[escolha])
-        player_team[slot] = player_slots[slot]["team"]
+        players[slot].pos = glm.vec3(player_slots[slot]["pos"])
+        players[slot].name = player_names[escolha]
+        players[slot].personagem = escolha
+        players[slot].stats = dict(personagem_stats[escolha])
+        players[slot].team = player_slots[slot]["team"]
 
     player_panels[1]["personagens"] = [
-        {"name": players[0]["name"], "color": players[0]["color"], "stats": players[0]["stats"], "team": 1, "player_index": 0},
-        {"name": players[1]["name"], "color": players[1]["color"], "stats": players[1]["stats"], "team": 1, "player_index": 1},
+        {"name": players[0].name, "stats": players[0].stats, "team": 1, "player_index": 0},
+        {"name": players[1].name, "stats": players[1].stats, "team": 1, "player_index": 1},
     ]
     player_panels[2]["personagens"] = [
-        {"name": players[2]["name"], "color": players[2]["color"], "stats": players[2]["stats"], "team": 2, "player_index": 2},
-        {"name": players[3]["name"], "color": players[3]["color"], "stats": players[3]["stats"], "team": 2, "player_index": 3},
+        {"name": players[2].name, "stats": players[2].stats, "team": 2, "player_index": 2},
+        {"name": players[3].name, "stats": players[3].stats, "team": 2, "player_index": 3},
     ]
 
 
@@ -770,7 +977,8 @@ def draw_selection_screen(window_width, window_height):
         draw_text(nome, nome_x, option["y"] - 34, nome_scale, (0.88, 0.90, 0.95), window_width, window_height)
 
         draw_button(option["x"] - 8, option["y"] - 8, option["w"] + 16, option["h"] + 16, border_color, window_width, window_height)
-        draw_button(option["x"], option["y"], option["w"], option["h"], option["color"], window_width, window_height)
+        draw_button(option["x"], option["y"], option["w"], option["h"], (0.03, 0.03, 0.04), window_width, window_height)
+        draw_character_portrait(index, option["x"] + 4, option["y"] + 4, option["w"] - 8, option["h"] - 8, window_width, window_height)
 
     slot_w = 72
     slot_h = 44
@@ -784,11 +992,15 @@ def draw_selection_screen(window_width, window_height):
     draw_text("JOGADOR 2", j2_x + group_w / 2 - get_text_width("JOGADOR 2", label_scale) / 2, slot_y - 28, label_scale, (0.88, 0.90, 0.95), window_width, window_height)
 
     for slot in range(2):
-        color = player_colors[jogador1_selecao[slot]] if slot < len(jogador1_selecao) else (0.18, 0.20, 0.24)
-        draw_button(j1_x + slot * (slot_w + slot_gap), slot_y, slot_w, slot_h, color, window_width, window_height)
+        j1_slot_x = j1_x + slot * (slot_w + slot_gap)
+        draw_button(j1_slot_x, slot_y, slot_w, slot_h, (0.18, 0.20, 0.24), window_width, window_height)
+        if slot < len(jogador1_selecao):
+            draw_character_portrait(jogador1_selecao[slot], j1_slot_x + 3, slot_y + 3, slot_w - 6, slot_h - 6, window_width, window_height)
 
-        color = player_colors[jogador2_selecao[slot]] if slot < len(jogador2_selecao) else (0.18, 0.20, 0.24)
-        draw_button(j2_x + slot * (slot_w + slot_gap), slot_y, slot_w, slot_h, color, window_width, window_height)
+        j2_slot_x = j2_x + slot * (slot_w + slot_gap)
+        draw_button(j2_slot_x, slot_y, slot_w, slot_h, (0.18, 0.20, 0.24), window_width, window_height)
+        if slot < len(jogador2_selecao):
+            draw_character_portrait(jogador2_selecao[slot], j2_slot_x + 3, slot_y + 3, slot_w - 6, slot_h - 6, window_width, window_height)
 
 
 def handle_selection_click(mouse_x, mouse_y):
@@ -863,12 +1075,6 @@ def get_text_width(text, scale):
     return text_renderer.measure(text, scale)
 
 
-def clamp_to_board(pos):
-    pos.x = max(-(board_half_width - 1.0), min(board_half_width - 1.0, pos.x))
-    pos.z = max(-(board_top_length - 1.0), min(board_bottom_length - 1.0, pos.z))
-    return pos
-
-
 def mouse_to_world_on_plane(mouse_x, mouse_y, plane_y):
     if current_view is None or current_projection is None:
         return None
@@ -902,35 +1108,6 @@ def mouse_to_world_on_plane(mouse_x, mouse_y, plane_y):
     return ray_origin + ray_dir * distance
 
 
-def get_draggable_objects():
-    objects = []
-
-    if blue_bag["carrier"] is None:
-        objects.append({
-            "kind": "blue_bag",
-            "index": None,
-            "pos": blue_bag["pos"],
-            "radius": 0.8,
-            "plane_y": 0.4,
-        })
-
-    if red_bag["carrier"] is None:
-        objects.append({
-            "kind": "red_bag",
-            "index": None,
-            "pos": red_bag["pos"],
-            "radius": 0.8,
-            "plane_y": 0.4,
-        })
-
-    if player_panels[1]["muro"] > 0:
-        objects.append({"kind": "red_barrier", "index": None, "pos": red_barrier_pos, "radius": 2.8, "plane_y": 0.05})
-    if player_panels[2]["muro"] > 0:
-        objects.append({"kind": "blue_barrier", "index": None, "pos": blue_barrier_pos, "radius": 2.8, "plane_y": 0.05})
-
-    return objects
-
-
 def get_clicked_player(mouse_x, mouse_y):
     nearest_index = None
     nearest_distance = 999999.0
@@ -940,8 +1117,8 @@ def get_clicked_player(mouse_x, mouse_y):
         if world_pos is None:
             continue
 
-        dx = world_pos.x - player["pos"].x
-        dz = world_pos.z - player["pos"].z
+        dx = world_pos.x - player.pos.x
+        dz = world_pos.z - player.pos.z
         distance = math.sqrt(dx * dx + dz * dz)
 
         if distance < 0.9 and distance < nearest_distance:
@@ -951,58 +1128,13 @@ def get_clicked_player(mouse_x, mouse_y):
     return nearest_index
 
 
-def set_object_position(kind, index, new_pos):
-    global blue_barrier_pos
-    global red_barrier_pos
-
-    new_pos = clamp_to_board(new_pos)
-
-    if kind == "blue_bag":
-        blue_bag["pos"].x = new_pos.x
-        blue_bag["pos"].z = new_pos.z
-
-    elif kind == "red_bag":
-        red_bag["pos"].x = new_pos.x
-        red_bag["pos"].z = new_pos.z
-
-    elif kind == "blue_barrier":
-        blue_barrier_pos.x = new_pos.x
-        blue_barrier_pos.z = new_pos.z
-
-    elif kind == "red_barrier":
-        red_barrier_pos.x = new_pos.x
-        red_barrier_pos.z = new_pos.z
-
-
-def cursor_position_callback(window, mouse_x, mouse_y):
-    global dragging
-
-    if dragging is None or vencedor is not None:
-        return
-
-    world_pos = mouse_to_world_on_plane(mouse_x, mouse_y, dragging["plane_y"])
-
-    if world_pos is None:
-        return
-
-    new_pos = world_pos + dragging["offset"]
-    new_pos.y = dragging["original_y"]
-
-    set_object_position(dragging["kind"], dragging["index"], new_pos)
-
-
 def mouse_button_callback(window, button, action, mods):
-    global dragging
     global selected_action_player
 
     if button != glfw.MOUSE_BUTTON_LEFT:
         return
 
     mouse_x, mouse_y = glfw.get_cursor_pos(window)
-
-    if action == glfw.RELEASE:
-        dragging = None
-        return
 
     if action != glfw.PRESS:
         return
@@ -1014,6 +1146,9 @@ def mouse_button_callback(window, button, action, mods):
     if vencedor is not None:
         return
 
+    if pending_turn_change_time is not None:
+        return
+
     if handle_action_click(mouse_x, mouse_y):
         return
 
@@ -1021,43 +1156,14 @@ def mouse_button_callback(window, button, action, mods):
         return
 
     clicked_player = get_clicked_player(mouse_x, mouse_y)
-    if clicked_player is not None and player_team[clicked_player] == jogador_turno:
+    if clicked_player is not None and players[clicked_player].team == jogador_turno:
         selected_action_player = clicked_player
-        return
-
-    nearest_object = None
-    nearest_distance = 999999.0
-
-    for obj in get_draggable_objects():
-        world_pos = mouse_to_world_on_plane(mouse_x, mouse_y, obj["plane_y"])
-
-        if world_pos is None:
-            continue
-
-        dx = world_pos.x - obj["pos"].x
-        dz = world_pos.z - obj["pos"].z
-        distance = math.sqrt(dx * dx + dz * dz)
-
-        if distance < obj["radius"] and distance < nearest_distance:
-            nearest_object = obj
-            nearest_distance = distance
-
-    if nearest_object is not None:
-        world_pos = mouse_to_world_on_plane(mouse_x, mouse_y, nearest_object["plane_y"])
-
-        dragging = {
-            "kind": nearest_object["kind"],
-            "index": nearest_object["index"],
-            "plane_y": nearest_object["plane_y"],
-            "original_y": nearest_object["pos"].y,
-            "offset": nearest_object["pos"] - world_pos,
-        }
 
 
 
 
 def run():
-    global window, hand_cursor, shader, button_shader, button_vao, button_vbo, text_renderer, cube_vao, cube_count, sphere_vao, sphere_count, barrier_vao, barrier_count, projection_loc, view_loc, model_loc, object_color_loc, light_color_loc, light_pos_loc, view_pos_loc, camera_distance, camera_angle, camera_target_angle, camera_forward_offset, board_half_width, board_bottom_length, board_top_length, action_buttons, action_hovered, dragging, tela_atual, jogador_selecionando, jogador1_selecao, jogador2_selecao, player_team, current_view, current_projection, current_window_width, current_window_height, blue_barrier_pos, red_barrier_pos, roleta_x, roleta_y, roleta_largura, roleta_altura, roleta_tipos, roleta_opcoes, roleta_resultados, roleta_girando, roleta_fim_tempo, roleta_proximo_tick, jogador_turno, space_pressed_last, selected_action_player, action_key_1_last, action_key_2_last, action_key_3_last, action_key_4_last, vencedor, players, player_colors, player_names, personagem_stats, player_panels, blue_bag, red_bag
+    global window, hand_cursor, shader, button_shader, button_vao, button_vbo, text_renderer, character_textures, character_models, cube_vao, cube_count, barrier_vao, barrier_count, moedas_vao, moedas_count, floor_vao, floor_count, floor_texture, barreira_texture, projection_loc, view_loc, model_loc, object_color_loc, use_vertex_color_loc, use_texture_loc, light_color_loc, light_pos_loc, view_pos_loc, camera_distance, camera_angle, camera_target_angle, camera_forward_offset, board_half_width, board_bottom_length, board_top_length, action_buttons, action_hovered, tela_atual, jogador_selecionando, jogador1_selecao, jogador2_selecao, current_view, current_projection, current_window_width, current_window_height, blue_barrier_pos, red_barrier_pos, roleta_x, roleta_y, roleta_largura, roleta_altura, roleta_tipos, roleta_opcoes, roleta_resultados, roleta_girando, roleta_fim_tempo, roleta_proximo_tick, jogador_turno, space_pressed_last, selected_action_player, action_key_1_last, action_key_2_last, action_key_3_last, action_key_4_last, vencedor, players, player_names, personagem_stats, player_panels, blue_bag, red_bag, hit_reaction, pending_turn_change_time
 
     # Inicializacao da janela, contexto OpenGL e buffers usados pelo jogo.
     if not glfw.init():
@@ -1066,6 +1172,7 @@ def run():
     glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+    glfw.window_hint(glfw.SAMPLES, 4)
 
     window = glfw.create_window(
         WINDOW_WIDTH,
@@ -1082,20 +1189,25 @@ def run():
     glfw.make_context_current(window)
     glfw.set_framebuffer_size_callback(window, framebuffer_size_callback)
     glfw.set_mouse_button_callback(window, mouse_button_callback)
-    glfw.set_cursor_pos_callback(window, cursor_position_callback)
     hand_cursor = glfw.create_standard_cursor(glfw.HAND_CURSOR)
 
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_BLEND)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glEnable(GL_MULTISAMPLE)
 
     shader = create_shader_program(VERTEX_SHADER, FRAGMENT_SHADER)
     button_shader, button_vao, button_vbo = create_button_renderer()
     text_renderer = TextRenderer()
+    character_textures = load_character_textures()
 
     cube_vao, cube_count = create_cube()
-    sphere_vao, sphere_count = create_sphere()
-    barrier_vao, barrier_count = create_curved_barrier()
+    character_models = load_character_models()
+    barrier_vao, barrier_count = create_mesh_from_npz(MODEL_DIR / "barreira.npz")
+    moedas_vao, moedas_count = create_mesh_from_npz(MODEL_DIR / "moedas.npz")
+    floor_vao, floor_count = create_textured_quad(1.0, 1.0)
+    floor_texture = load_floor_texture(ASSET_DIR / "texturas" / "piso.jpg")
+    barreira_texture = load_floor_texture(ASSET_DIR / "texturas" / "madeira_musgo.jpg")
 
     camera_distance = CAMERA_DISTANCE
     camera_angle = CAMERA_ANGLE
@@ -1108,13 +1220,10 @@ def run():
 
     action_buttons = []
     action_hovered = False
-    dragging = None
     tela_atual = "selecao"
     jogador_selecionando = 1
     jogador1_selecao = []
     jogador2_selecao = []
-    player_team = [1, 1, 2, 2]
-
     current_view = None
     current_projection = None
     current_window_width = WINDOW_WIDTH
@@ -1145,19 +1254,14 @@ def run():
     action_key_3_last = False
     action_key_4_last = False
     vencedor = None
+    hit_reaction = None
+    pending_turn_change_time = None
 
     players = [
-        {"name": "TIGRE", "pos": glm.vec3(-4.49, 0.5, 12.56), "color": (0.2, 0.5, 1.0)},
-        {"name": "DRAGAO", "pos": glm.vec3(4.47, 0.5, 12.60), "color": (1.0, 0.25, 0.25)},
-        {"name": "PANDA", "pos": glm.vec3(-4.31, 0.5, -12.76), "color": (0.25, 0.85, 0.45)},
-        {"name": "MACACO", "pos": glm.vec3(4.62, 0.5, -12.88), "color": (0.75, 0.35, 1.0)}
-    ]
-
-    player_colors = [
-        (0.2, 0.5, 1.0),
-        (1.0, 0.25, 0.25),
-        (0.25, 0.85, 0.45),
-        (0.75, 0.35, 1.0),
+        Player("TIGRE", glm.vec3(-4.49, 0.5, 12.56), team=1),
+        Player("DRAGAO", glm.vec3(4.47, 0.5, 12.60), team=1),
+        Player("PANDA", glm.vec3(-4.31, 0.5, -12.76), team=2),
+        Player("MACACO", glm.vec3(4.62, 0.5, -12.88), team=2),
     ]
 
     player_names = [
@@ -1245,8 +1349,8 @@ def run():
             "saco_moedas": 10,
             "saco_moedas_max": 10,
             "personagens": [
-                {"name": player_names[0], "color": player_colors[0], "stats": dict(personagem_stats[0]), "team": 1, "player_index": 0},
-                {"name": player_names[1], "color": player_colors[1], "stats": dict(personagem_stats[1]), "team": 1, "player_index": 1},
+                {"name": player_names[0], "stats": dict(personagem_stats[0]), "team": 1, "player_index": 0},
+                {"name": player_names[1], "stats": dict(personagem_stats[1]), "team": 1, "player_index": 1},
             ],
         },
         2: {
@@ -1255,8 +1359,8 @@ def run():
             "saco_moedas": 10,
             "saco_moedas_max": 10,
             "personagens": [
-                {"name": player_names[2], "color": player_colors[2], "stats": dict(personagem_stats[2]), "team": 2, "player_index": 2},
-                {"name": player_names[3], "color": player_colors[3], "stats": dict(personagem_stats[3]), "team": 2, "player_index": 3},
+                {"name": player_names[2], "stats": dict(personagem_stats[2]), "team": 2, "player_index": 2},
+                {"name": player_names[3], "stats": dict(personagem_stats[3]), "team": 2, "player_index": 3},
             ],
         },
     }
@@ -1264,8 +1368,12 @@ def run():
     blue_bag = {"pos": glm.vec3(0.15, 0.4, 9.44), "carrier": None}
     red_bag = {"pos": glm.vec3(-0.03, 0.4, -9.22), "carrier": None}
 
+    last_frame_time = glfw.get_time()
+
     while not glfw.window_should_close(window):
         current_frame = glfw.get_time()
+        delta_time = current_frame - last_frame_time
+        last_frame_time = current_frame
 
         glfw.poll_events()
 
@@ -1295,35 +1403,41 @@ def run():
 
         atualizar_roleta(current_frame)
 
-        if not roleta_girando and vencedor is None:
+        if pending_turn_change_time is not None and current_frame >= pending_turn_change_time:
+            pending_turn_change_time = None
+            hit_reaction = None
+            if vencedor is None:
+                finalizar_turno_apos_acao()
+
+        if not roleta_girando and vencedor is None and pending_turn_change_time is None:
             verificar_teclas_de_acao()
 
         for i, player in enumerate(players):
-            pos = player["pos"]
+            pos = player.pos
 
-            if player_team[i] == 1 and red_bag["carrier"] is None:
+            if players[i].team == 1 and red_bag["carrier"] is None:
                 if glm.distance(pos, red_bag["pos"]) < 1.2:
                     red_bag["carrier"] = i
 
-            if player_team[i] == 2 and blue_bag["carrier"] is None:
+            if players[i].team == 2 and blue_bag["carrier"] is None:
                 if glm.distance(pos, blue_bag["pos"]) < 1.2:
                     blue_bag["carrier"] = i
 
         if blue_bag["carrier"] is not None:
-            blue_bag["pos"] = players[blue_bag["carrier"]]["pos"] + glm.vec3(0, 0.7, 0)
+            blue_bag["pos"] = players[blue_bag["carrier"]].pos + glm.vec3(0, 0.7, 0)
 
         if red_bag["carrier"] is not None:
-            red_bag["pos"] = players[red_bag["carrier"]]["pos"] + glm.vec3(0, 0.7, 0)
+            red_bag["pos"] = players[red_bag["carrier"]].pos + glm.vec3(0, 0.7, 0)
 
-        if red_bag["carrier"] is not None and player_team[red_bag["carrier"]] == 1:
-            carrier_pos = players[red_bag["carrier"]]["pos"]
+        if red_bag["carrier"] is not None and players[red_bag["carrier"]].team == 1:
+            carrier_pos = players[red_bag["carrier"]].pos
 
             if glm.distance(carrier_pos, glm.vec3(0, 0.05, 5.5)) < 1.5:
                 red_bag["carrier"] = None
                 red_bag["pos"] = glm.vec3(0, 0.4, -5.5)
 
-        if blue_bag["carrier"] is not None and player_team[blue_bag["carrier"]] == 2:
-            carrier_pos = players[blue_bag["carrier"]]["pos"]
+        if blue_bag["carrier"] is not None and players[blue_bag["carrier"]].team == 2:
+            carrier_pos = players[blue_bag["carrier"]].pos
 
             if glm.distance(carrier_pos, glm.vec3(0, 0.05, -5.5)) < 1.5:
                 blue_bag["carrier"] = None
@@ -1337,7 +1451,10 @@ def run():
         width, height = glfw.get_framebuffer_size(window)
         aspect = width / height
 
-        camera_angle = camera_target_angle
+        # Aproximacao suave (lerp) do angulo atual em direcao ao angulo alvo,
+        # em vez de saltar instantaneamente quando o turno muda.
+        angle_diff = camera_target_angle - camera_angle
+        camera_angle += angle_diff * min(1.0, delta_time * CAMERA_TURN_SPEED)
 
         forward_x = -math.sin(camera_angle)
         forward_z = -math.cos(camera_angle)
@@ -1376,6 +1493,9 @@ def run():
         view_loc = glGetUniformLocation(shader, "view")
         model_loc = glGetUniformLocation(shader, "model")
         object_color_loc = glGetUniformLocation(shader, "objectColor")
+        use_vertex_color_loc = glGetUniformLocation(shader, "useVertexColor")
+        use_texture_loc = glGetUniformLocation(shader, "useTexture")
+        glUniform1i(glGetUniformLocation(shader, "objectTexture"), 0)
         light_color_loc = glGetUniformLocation(shader, "lightColor")
         light_pos_loc = glGetUniformLocation(shader, "lightPos")
         view_pos_loc = glGetUniformLocation(shader, "viewPos")
@@ -1383,18 +1503,29 @@ def run():
         glUniformMatrix4fv(projection_loc, 1, GL_FALSE, glm.value_ptr(projection))
         glUniformMatrix4fv(view_loc, 1, GL_FALSE, glm.value_ptr(view))
 
-        glUniform3f(light_color_loc, 1, 1, 1)
-        glUniform3f(light_pos_loc, 0, 14, 0)
-        glUniform3fv(view_pos_loc, 1, glm.value_ptr(camera_pos))
-
         board_center_z = (board_bottom_length - board_top_length) / 2.0
+
+        # Iluminacao dinamica: a luz orbita lentamente sobre o tabuleiro,
+        # mas a intensidade fica sempre fixa e clara (sem escurecer).
+        light_angle = current_frame * LIGHT_ORBIT_SPEED
+        light_pos = glm.vec3(
+            math.sin(light_angle) * LIGHT_ORBIT_RADIUS,
+            LIGHT_ORBIT_HEIGHT,
+            math.cos(light_angle) * LIGHT_ORBIT_RADIUS + board_center_z
+        )
+
+        glUniform3f(light_color_loc, 1.0, 1.0, 1.0)
+        glUniform3fv(light_pos_loc, 1, glm.value_ptr(light_pos))
+        glUniform3fv(view_pos_loc, 1, glm.value_ptr(camera_pos))
         board_total_half = (board_bottom_length + board_top_length) / 2.0
 
         draw_cube(
             glm.vec3(0, -0.15, board_center_z),
             glm.vec3(board_half_width, 0.1, board_total_half),
-            (0.88, 0.88, 0.90)
+            (0.45, 0.35, 0.22)
         )
+
+        draw_floor(glm.vec3(0, -0.03, board_center_z), board_half_width * 2, board_total_half * 2)
 
         border_color = (0.55, 0.55, 0.55)
 
@@ -1404,18 +1535,18 @@ def run():
         draw_cube(glm.vec3(board_half_width, 0.35, board_center_z), glm.vec3(0.2, 0.4, board_total_half), border_color)
 
         if player_panels[1]["muro"] > 0:
-            draw_barrier(red_barrier_pos, (0.55, 0.55, 0.55), 0)
+            draw_barrier(red_barrier_pos, 0, 1, current_frame)
         if player_panels[2]["muro"] > 0:
-            draw_barrier(blue_barrier_pos, (0.55, 0.55, 0.55), 180)
+            draw_barrier(blue_barrier_pos, 180, 2, current_frame)
 
         for index, player in enumerate(players):
             if selected_action_player == index:
-                draw_sphere(player["pos"], 0.72, player["color"])
+                draw_character_model(index, 1.15, current_frame)
             else:
-                draw_sphere(player["pos"], 0.6, player["color"])
+                draw_character_model(index, 1.0, current_frame)
 
-        draw_cube(blue_bag["pos"], glm.vec3(0.45, 0.45, 0.45), (1.0, 0.9, 0.15))
-        draw_cube(red_bag["pos"], glm.vec3(0.45, 0.45, 0.45), (1.0, 0.65, 0.05))
+        draw_bag_model(blue_bag["pos"], (1.0, 0.9, 0.15), 2, current_frame)
+        draw_bag_model(red_bag["pos"], (1.0, 0.65, 0.05), 1, current_frame)
 
         glDisable(GL_DEPTH_TEST)
         glUseProgram(button_shader)
